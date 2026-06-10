@@ -27,6 +27,15 @@ struct PutSuccess(Movable, Copyable, ImplicitlyCopyable):
     var etag: String     # ETag of the uploaded object
 
 
+@fieldwise_init
+struct UploadProgress(Movable, Copyable, ImplicitlyCopyable):
+    """Progress information for auto-multipart uploads."""
+    var bytes_uploaded: Int
+    var total_bytes: Int
+    var parts_completed: Int
+    var total_parts: Int
+
+
 struct DeleteSuccess(Movable, Copyable):
     """Result of a successful delete request."""
     var _dummy: Bool

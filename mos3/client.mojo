@@ -6,24 +6,37 @@ from std.python import Python, PythonObject
 from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
 from mos3_signing.signing import sign_request, _sha256_hex
 from mos3_signing.error import S3Error
-from mos3.types import StatSuccess, GetSuccess, PutSuccess, DeleteSuccess, ListObjectsV2Result
+from mos3.types import StatSuccess, GetSuccess, PutSuccess, DeleteSuccess, ListObjectsV2Result, UploadProgress
 from mos3.xml_parser import parse_list_objects_v2, parse_s3_error
+from mos3.stream.upload import MultipartUpload, PartInfo
 from std.collections import Dict
+
+
+@fieldwise_init
+struct RetryConfig(Movable, Copyable, ImplicitlyCopyable):
+    var max_retries: Int
+    var base_delay_ms: Int
+    var max_delay_ms: Int
+
+    @staticmethod
+    def create(max_retries: Int = 3, base_delay_ms: Int = 100, max_delay_ms: Int = 5000) -> Self:
+        return Self(max_retries=max_retries, base_delay_ms=base_delay_ms, max_delay_ms=max_delay_ms)
 
 
 @fieldwise_init
 struct S3Client(Movable, ImplicitlyCopyable, Writable):
     var credentials: S3Credentials
+    var retry_config: RetryConfig
 
     @staticmethod
-    def create(credentials: S3Credentials) -> Self:
-        return Self(credentials=credentials)
+    def create(credentials: S3Credentials, retry_config: RetryConfig = RetryConfig.create()) -> Self:
+        return Self(credentials=credentials, retry_config=retry_config)
 
     # ── stat (HEAD) ─────────────────────────────────────────────
 
     def stat(self, path: String) raises -> StatSuccess:
         """Get object metadata without downloading the body."""
-        var response = _do_s3_request(self.credentials, path, "HEAD", body="")
+        var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
         var status = Int(py=_get_status(response))
 
         if status == 200:
@@ -42,7 +55,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
     def get(self, path: String) raises -> GetSuccess:
         """Download an object. Returns body as String."""
-        var response = _do_s3_request(self.credentials, path, "GET", body="")
+        var response = _do_s3_request_with_retry(self, path, "GET", body="")
         var status = Int(py=_get_status(response))
 
         if status == 200:
@@ -67,8 +80,8 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     ) raises -> PutSuccess:
         """Upload an object."""
         var content_hash = _sha256_hex(body)
-        var response = _do_s3_request(
-            self.credentials, path, "PUT",
+        var response = _do_s3_request_with_retry(
+            self, path, "PUT",
             body=body,
             content_hash=content_hash,
             content_type=content_type,
@@ -83,7 +96,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
     def delete(self, path: String) raises -> DeleteSuccess:
         """Delete an object. Returns DeleteSuccess even if already deleted."""
-        var response = _do_s3_request(self.credentials, path, "DELETE", body="")
+        var response = _do_s3_request_with_retry(self, path, "DELETE", body="")
         var status = Int(py=_get_status(response))
         if status == 200 or status == 204:
             return DeleteSuccess()
@@ -112,8 +125,8 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
         if delimiter != "":
             search_params += "&delimiter=" + _url_encode(delimiter)
 
-        var response = _do_s3_request(
-            self.credentials, "", "GET",
+        var response = _do_s3_request_with_retry(
+            self, "", "GET",
             body="",
             search_params=search_params,
         )
@@ -132,7 +145,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
     def create_bucket(self) raises -> Bool:
         """Create the configured bucket. Returns True on success."""
-        var response = _do_s3_request(self.credentials, "", "PUT", body="")
+        var response = _do_s3_request_with_retry(self, "", "PUT", body="")
         var status = Int(py=_get_status(response))
         return status == 200
 
@@ -157,32 +170,47 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
             )
 
         var empty_hash = _sha256_hex("")
-        var sign_result = sign_request(dest_creds, SignOptions.create(
-            path=dst,
-            method="PUT",
-            content_hash=empty_hash,
-        ))
 
-        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
-        var port = Int(py=port_py)
-        var http_client = Python.import_module("http.client")
-        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+        var config = self.retry_config
+        var attempt: Int = 0
 
-        var py_headers = Python.dict()
-        py_headers["Authorization"] = sign_result.authorization_header
-        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
-        py_headers["x-amz-date"] = sign_result.amz_date
-        py_headers["x-amz-copy-source"] = PythonObject(copy_source)
-        if sign_result.security_token_header != "":
-            py_headers["x-amz-security-token"] = sign_result.security_token_header
+        while True:
+            try:
+                var sign_result = sign_request(dest_creds, SignOptions.create(
+                    path=dst,
+                    method="PUT",
+                    content_hash=empty_hash,
+                ))
 
-        conn.request("PUT", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
-        var response = conn.getresponse()
-        var status = Int(py=_get_status(response))
-        if status == 200:
-            return True
-        _raise_http_error_obj(response)
-        raise Error(String("Unexpected copy response"))
+                var (host, port_py, path_and_query) = _parse_url(sign_result.url)
+                var port = Int(py=port_py)
+                var http_client = Python.import_module("http.client")
+                var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+
+                var py_headers = Python.dict()
+                py_headers["Authorization"] = sign_result.authorization_header
+                py_headers["x-amz-content-sha256"] = sign_result.content_sha256
+                py_headers["x-amz-date"] = sign_result.amz_date
+                py_headers["x-amz-copy-source"] = PythonObject(copy_source)
+                if sign_result.security_token_header != "":
+                    py_headers["x-amz-security-token"] = sign_result.security_token_header
+
+                conn.request("PUT", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
+                var response = conn.getresponse()
+                var status = Int(py=_get_status(response))
+                if status == 200:
+                    return True
+                # Non-200 status
+                if status < 500 or attempt >= config.max_retries:
+                    _raise_http_error_obj(response)
+                    raise Error(String("Unexpected copy response"))
+                # 5xx with retries remaining - fall through to sleep
+            except e:
+                if attempt >= config.max_retries:
+                    raise e
+
+            _sleep_backoff(config, attempt)
+            attempt += 1
 
     # ── put_with_metadata ───────────────────────────────────────
 
@@ -195,34 +223,20 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     ) raises -> PutSuccess:
         """Upload an object with custom metadata headers."""
         var content_hash = _sha256_hex(body)
-        var sign_result = sign_request(self.credentials, SignOptions.create(
-            path=path,
-            method="PUT",
-            content_hash=content_hash,
-            content_type=content_type,
-        ))
 
-        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
-        var port = Int(py=port_py)
-        var http_client = Python.import_module("http.client")
-        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
-
-        var py_headers = Python.dict()
-        py_headers["Authorization"] = sign_result.authorization_header
-        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
-        py_headers["x-amz-date"] = sign_result.amz_date
-        py_headers["Content-Type"] = PythonObject(content_type)
-        if sign_result.security_token_header != "":
-            py_headers["x-amz-security-token"] = sign_result.security_token_header
-
-        # Add metadata headers
+        # Build extra headers for metadata
+        var extra_headers = Dict[String, String]()
         for entry in metadata.items():
             var key = "x-amz-meta-" + entry.key
-            py_headers[key] = PythonObject(entry.value)
+            extra_headers[key] = entry.value
 
-        var body_bytes = PythonObject(body).encode("utf-8")
-        conn.request("PUT", path_and_query, body=body_bytes, headers=py_headers)
-        var response = conn.getresponse()
+        var response = _do_s3_request_with_retry(
+            self, path, "PUT",
+            body=body,
+            content_hash=content_hash,
+            content_type=content_type,
+            extra_headers=extra_headers,
+        )
         var status = Int(py=_get_status(response))
 
         if status == 200:
@@ -230,11 +244,145 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
         _raise_http_error_obj(response)
         raise Error(String("Unexpected put_with_metadata response"))
 
+    # ── put_auto ─────────────────────────────────────────────────
+
+    def put_auto(
+        self,
+        path: String,
+        body: String,
+        content_type: String = "application/octet-stream",
+        part_size: Int = 5 * 1024 * 1024,
+    ) raises -> PutSuccess:
+        """Upload an object, automatically using multipart for large bodies.
+
+        If body.byte_length() <= part_size, uses a single PUT.
+        Otherwise, initiates a multipart upload, splits the body into
+        part_size chunks, uploads parts sequentially, and completes.
+        """
+        var total_bytes = body.byte_length()
+        if total_bytes <= part_size:
+            return self.put(path, body, content_type=content_type)
+
+        # Initiate multipart upload
+        var mpu = MultipartUpload.create(self.credentials, path, content_type=content_type)
+
+        # Convert body to Python bytes for efficient slicing
+        var body_bytes = PythonObject(body).encode("utf-8")
+        var part_num: Int = 1
+        var offset: Int = 0
+        var total_parts = (total_bytes + part_size - 1) // part_size
+
+        while offset < total_bytes:
+            var end = offset + part_size
+            if end > total_bytes:
+                end = total_bytes
+
+            # Extract chunk using Python slicing (same pattern as upload_file)
+            var chunk_bytes = Python.evaluate("lambda d,o,e: d[o:e]")(
+                body_bytes, PythonObject(offset), PythonObject(end)
+            )
+            var chunk_str = String(py=chunk_bytes.decode("utf-8"))
+
+            _ = mpu.upload_part(part_num, chunk_str)
+            print("  [mos3] part", part_num, "/", total_parts, "uploaded")
+
+            part_num += 1
+            offset = end
+
+        # Complete the multipart upload
+        var ok = mpu.complete()
+        if not ok:
+            raise Error(String("Failed to complete multipart upload for ", path))
+
+        # Get the final ETag via stat
+        var stat_result = self.stat(path)
+        return PutSuccess(etag=stat_result.etag)
+
+    # ── put_with_progress ────────────────────────────────────────
+
+    def put_with_progress(
+        self,
+        path: String,
+        body: String,
+        on_progress: PythonObject,
+        content_type: String = "application/octet-stream",
+        part_size: Int = 5 * 1024 * 1024,
+    ) raises -> PutSuccess:
+        """Upload an object with progress callbacks.
+
+        on_progress is a Python callable(bytes_uploaded, total_bytes,
+        parts_completed, total_parts) called after each part is uploaded.
+        For single-part uploads, called once with the full size.
+        """
+        var total_bytes = body.byte_length()
+        if total_bytes <= part_size:
+            var result = self.put(path, body, content_type=content_type)
+            on_progress(PythonObject(total_bytes), PythonObject(total_bytes), PythonObject(1), PythonObject(1))
+            return result
+
+        var mpu = MultipartUpload.create(self.credentials, path, content_type=content_type)
+
+        var body_bytes = PythonObject(body).encode("utf-8")
+        var part_num: Int = 1
+        var offset: Int = 0
+        var total_parts = (total_bytes + part_size - 1) // part_size
+
+        while offset < total_bytes:
+            var end = offset + part_size
+            if end > total_bytes:
+                end = total_bytes
+
+            var chunk_bytes = Python.evaluate("lambda d,o,e: d[o:e]")(
+                body_bytes, PythonObject(offset), PythonObject(end)
+            )
+            var chunk_str = String(py=chunk_bytes.decode("utf-8"))
+
+            _ = mpu.upload_part(part_num, chunk_str)
+
+            # Call progress callback
+            on_progress(
+                PythonObject(end),
+                PythonObject(total_bytes),
+                PythonObject(part_num),
+                PythonObject(total_parts),
+            )
+
+            part_num += 1
+            offset = end
+
+        var ok = mpu.complete()
+        if not ok:
+            raise Error(String("Failed to complete multipart upload for ", path))
+
+        var stat_result = self.stat(path)
+        return PutSuccess(etag=stat_result.etag)
+
+    # ── put_file ─────────────────────────────────────────────────
+
+    def put_file(
+        self,
+        path: String,
+        file_path: String,
+        content_type: String = "application/octet-stream",
+    ) raises -> PutSuccess:
+        """Read a local file and upload it using auto-multipart.
+
+        Uses Python's builtins.open to read the file in binary mode.
+        Delegates to put_auto for the actual upload.
+        """
+        var py_builtins = Python.import_module("builtins")
+        var f = py_builtins.open(file_path, "rb")
+        var file_data = f.read()
+        f.close()
+
+        var body = String(py=file_data.decode("utf-8"))
+        return self.put_auto(path, body, content_type=content_type)
+
     # ── head_object ─────────────────────────────────────────────
 
     def head_object(self, path: String) raises -> Dict[String, String]:
         """Return ALL response headers for an object."""
-        var response = _do_s3_request(self.credentials, path, "HEAD", body="")
+        var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
         var status = Int(py=_get_status(response))
 
         if status == 200:
@@ -248,7 +396,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
     def object_exists(self, path: String) raises -> Bool:
         """Return True if the object exists."""
-        var response = _do_s3_request(self.credentials, path, "HEAD", body="")
+        var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
         var status = Int(py=_get_status(response))
         return status == 200
 
@@ -256,7 +404,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
     def bucket_exists(self) raises -> Bool:
         """Return True if the bucket exists (HEAD to bucket root)."""
-        var response = _do_s3_request(self.credentials, "", "HEAD", body="")
+        var response = _do_s3_request_with_retry(self, "", "HEAD", body="")
         var status = Int(py=_get_status(response))
         return status == 200
 
@@ -268,27 +416,15 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
         """Download a byte range from an object."""
         var range_val = "bytes=" + String(offset) + "-" + String(offset + size - 1)
 
-        # Build and sign the request manually to add Range header
-        var sign_result = sign_request(self.credentials, SignOptions.create(
-            path=path,
-            method="GET",
-        ))
+        # Build extra headers with Range
+        var extra_headers = Dict[String, String]()
+        extra_headers["Range"] = range_val
 
-        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
-        var port = Int(py=port_py)
-        var http_client = Python.import_module("http.client")
-        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
-
-        var py_headers = Python.dict()
-        py_headers["Authorization"] = sign_result.authorization_header
-        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
-        py_headers["x-amz-date"] = sign_result.amz_date
-        py_headers["Range"] = PythonObject(range_val)
-        if sign_result.security_token_header != "":
-            py_headers["x-amz-security-token"] = sign_result.security_token_header
-
-        conn.request("GET", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
-        var response = conn.getresponse()
+        var response = _do_s3_request_with_retry(
+            self, path, "GET",
+            body="",
+            extra_headers=extra_headers,
+        )
         var status = Int(py=_get_status(response))
 
         if status == 200 or status == 206:
@@ -329,6 +465,57 @@ def _get_response_header(response: PythonObject, name: String, default: String) 
         return default
 
 
+def _sleep_backoff(config: RetryConfig, attempt: Int) raises:
+    """Sleep with exponential backoff: base_delay_ms * 2^attempt, capped at max_delay_ms."""
+    var delay_ms = config.base_delay_ms
+    for _ in range(attempt):
+        delay_ms = delay_ms * 2
+        if delay_ms > config.max_delay_ms:
+            delay_ms = config.max_delay_ms
+    var delay_sec = Float64(delay_ms) / 1000.0
+    var time = Python.import_module("time")
+    time.sleep(PythonObject(delay_sec))
+
+
+def _do_s3_request_with_retry(
+    client: S3Client,
+    path: String,
+    method: String,
+    body: String = "",
+    content_hash: String = "",
+    content_type: String = "",
+    search_params: String = "",
+    extra_headers: Dict[String, String] = Dict[String, String](),
+) raises -> PythonObject:
+    """Execute _do_s3_request with retry on 5xx or connection errors."""
+    var config = client.retry_config
+    var attempt: Int = 0
+
+    while True:
+        try:
+            var response = _do_s3_request(
+                client.credentials, path, method,
+                body=body,
+                content_hash=content_hash,
+                content_type=content_type,
+                search_params=search_params,
+                extra_headers=extra_headers,
+            )
+            var status = Int(py=_get_status(response))
+            if status < 500:
+                return response
+            # 5xx - retry if attempts remain, otherwise return as-is
+            if attempt >= config.max_retries:
+                return response  # Let caller handle the 5xx
+        except e:
+            # Connection or other error
+            if attempt >= config.max_retries:
+                raise e^
+
+        _sleep_backoff(config, attempt)
+        attempt += 1
+
+
 def _do_s3_request(
     credentials: S3Credentials,
     path: String,
@@ -337,6 +524,7 @@ def _do_s3_request(
     content_hash: String = "",
     content_type: String = "",
     search_params: String = "",
+    extra_headers: Dict[String, String] = Dict[String, String](),
 ) raises -> PythonObject:
     """
     Sign an S3 request and execute it via Python http.client.
@@ -370,6 +558,10 @@ def _do_s3_request(
         py_headers["x-amz-security-token"] = sign_result.security_token_header
     if content_type != "":
         py_headers["Content-Type"] = content_type
+
+    # Add extra headers
+    for entry in extra_headers.items():
+        py_headers[entry.key] = PythonObject(entry.value)
 
     var body_bytes = Python.none()
     if body != "":

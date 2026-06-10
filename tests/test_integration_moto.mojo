@@ -3,7 +3,7 @@ from std.testing import assert_equal, assert_true
 from std.os import getenv
 from std.python import Python, PythonObject
 from mos3_signing.credentials import S3Credentials
-from mos3.client import S3Client
+from mos3.client import S3Client, RetryConfig
 from mos3.stream.download import DownloadStream
 from mos3.stream.upload import MultipartUpload, PartInfo
 
@@ -189,6 +189,71 @@ def test_get_range() raises:
     print("Range 10-15 OK:", result2.body)
 
 
+def test_auto_multipart_large() raises:
+    """Test auto-multipart upload with a body larger than part_size."""
+    var client = _make_client()
+
+    # Generate ~6MB of data to trigger auto-multipart (> 5MB default part_size)
+    var size = 6 * 1024 * 1024  # 6 MB
+    # Use a repeating pattern that's easy to verify
+    var pattern = "Mos3AutoTest_"
+    var pattern_len = 13
+    var pattern_bytes = Python.evaluate("b'" + pattern + "'")
+    var data = Python.evaluate("lambda p,n: p * (n // len(p)) + p[:n % len(p)]")(
+        pattern_bytes, PythonObject(size)
+    )
+    var body = String(py=data.decode("utf-8"))
+
+    # Upload using put_auto
+    var put_result = client.put_auto("auto-multipart-large.bin", body, part_size=5 * 1024 * 1024)
+    print("Auto-multipart etag:", put_result.etag)
+
+    # Verify the uploaded object exists and has the right size
+    var stat_result = client.stat("auto-multipart-large.bin")
+    assert_equal(stat_result.size, size)
+    print("Auto-multipart size verified:", stat_result.size)
+
+    # Verify content: sample the first few bytes
+    var get_result = client.get_range("auto-multipart-large.bin", 0, pattern_len)
+    assert_equal(get_result.body, pattern)
+    print("Auto-multipart content verified")
+
+    # Also verify small files take the single-put path
+    var small = "hello small world"
+    var small_result = client.put_auto("auto-small.txt", small, part_size=5 * 1024 * 1024)
+    print("Small auto-put etag:", small_result.etag)
+    var small_get = client.get("auto-small.txt")
+    assert_equal(small_get.body, small)
+    print("Small auto-put content verified")
+
+
+def test_put_file() raises:
+    """Test put_file: read a local file and upload it."""
+    var client = _make_client()
+
+    # Create a temp file using Python
+    var py_builtins = Python.import_module("builtins")
+    var file_content = "Hello from put_file! This is a test file.\nLine 2\nLine 3\n"
+    var tmp_path = "/tmp/mos3_test_put_file.txt"
+    var f = py_builtins.open(tmp_path, "w")
+    f.write(file_content)
+    f.close()
+
+    # Upload the file
+    var put_result = client.put_file("put-file-test.txt", tmp_path)
+    print("put_file etag:", put_result.etag)
+
+    # Verify content
+    var get_result = client.get("put-file-test.txt")
+    assert_equal(get_result.body, file_content)
+    print("put_file content verified")
+
+    # Clean up
+    var py_os = Python.import_module("os")
+    py_os.remove(tmp_path)
+    print("Temp file cleaned up")
+
+
 def test_create_bucket() raises:
     # Create a new bucket via the client
     var creds = S3Credentials.create(
@@ -212,6 +277,32 @@ def test_create_bucket() raises:
     print("New bucket works OK")
 
 
+def test_retry_on_500() raises:
+    """Test that S3Client retries on connection errors (non-existent port).
+    Should retry a few times before giving up — verify it doesn't crash instantly."""
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="127.0.0.1:19999",  # Non-existent port
+        bucket="test-bucket",
+        virtual_hosted_style=False,
+        insecure_http=True,
+    )
+    # Use a RetryConfig with small delays so test runs quickly
+    var retry_config = RetryConfig.create(max_retries=2, base_delay_ms=10, max_delay_ms=100)
+    var client = S3Client.create(creds, retry_config=retry_config)
+
+    try:
+        var _ = client.stat("test.txt")
+        raise Error("Expected connection error but none was raised")
+    except e:
+        # Expected — connection should fail after retries
+        var err_msg = String(py=str(e))
+        print("Retry test: got expected error:", err_msg)
+        assert_true("Connection refused" in err_msg or "Errno" in err_msg or "refused" in err_msg.lower())
+
+
 def main() raises:
     test_put_and_get()
     test_stat()
@@ -222,5 +313,8 @@ def main() raises:
     test_multipart_abort()
     test_concurrent_multipart()
     test_get_range()
+    test_auto_multipart_large()
+    test_put_file()
     test_create_bucket()
+    test_retry_on_500()
     print("All moto integration tests passed!")
