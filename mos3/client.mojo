@@ -12,7 +12,7 @@ from std.collections import Dict
 
 
 @fieldwise_init
-struct S3Client(Movable):
+struct S3Client(Movable, ImplicitlyCopyable, Writable):
     var credentials: S3Credentials
 
     @staticmethod

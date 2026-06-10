@@ -7,7 +7,7 @@ from mos3_signing.error import S3Error
 
 
 @fieldwise_init
-struct S3Credentials(Movable, Copyable, ImplicitlyCopyable):
+struct S3Credentials(Movable, Copyable, ImplicitlyCopyable, Writable):
     """AWS S3 credentials and connection configuration."""
     var access_key_id: String
     var secret_access_key: String
