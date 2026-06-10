@@ -41,16 +41,19 @@ QUICK_ITERATIONS = 3
 
 
 def generate_data(size_bytes: int) -> bytes:
-    """Generate deterministic pseudo-random data of a given size."""
+    """Generate deterministic pseudo-random ASCII-safe data of a given size.
+    
+    Uses only printable ASCII (0x20-0x7E) to avoid encoding issues between
+    mos3 (which encodes strings as UTF-8) and boto3 (raw bytes).
+    """
     rng = random.Random(42)
-    # Generate in chunks to avoid huge memory spikes for 10MB
-    chunks = []
-    remaining = size_bytes
-    while remaining > 0:
-        chunk_size = min(remaining, 1024 * 1024)  # 1MB chunks
-        chunks.append(bytes(rng.randint(0, 255) for _ in range(chunk_size)))
-        remaining -= chunk_size
-    return b"".join(chunks)
+    ascii_chars = b"".join(
+        bytes([i]) for i in range(0x20, 0x7F)
+    )  # 95 printable ASCII chars
+    result = bytearray(size_bytes)
+    for i in range(size_bytes):
+        result[i] = ascii_chars[rng.randint(0, len(ascii_chars) - 1)]
+    return bytes(result)
 
 
 def time_operation(func, *args, **kwargs):
@@ -256,45 +259,47 @@ def main():
         # ── Benchmark: multipart upload 3×5MB ────────────────────
         print("Benchmarking multipart upload 3×5MB...")
 
-        # mos3 multipart (via subprocess Mojo helper)
+        # mos3 multipart (via subprocess Mojo helper — parses internal timing)
         mojo_bin = os.path.join(PROJECT_ROOT, ".venv", "bin", "mojo")
         bench_mojo = os.path.join(PROJECT_ROOT, "tests", "_bench_mojo.mojo")
 
-        # We'll create a temp data file for the mojo multipart test
-        # Actually, the mojo script generates its own data — pass key via env
+        def _run_mojo_mp(key_suffix):
+            """Run the Mojo multipart benchmark and return internal elapsed ms."""
+            proc = subprocess.run(
+                [mojo_bin, "run", "-I", ".", bench_mojo],
+                env={**os.environ, "MOTO_PORT": str(port),
+                     "BENCH_KEY": f"bench-mp-mos3-{key_suffix}", "NUM_PARTS": "3", "PART_SIZE_MB": "5"},
+                capture_output=True, text=True, timeout=120,
+                cwd=PROJECT_ROOT,
+            )
+            # Parse BENCH_MS: <milliseconds> from stdout
+            for line in proc.stdout.splitlines():
+                if line.startswith("BENCH_MS:"):
+                    return float(line.split(":")[1].strip())
+            # Fallback: parse stderr or raise
+            for line in proc.stderr.splitlines():
+                if line.startswith("BENCH_MS:"):
+                    return float(line.split(":")[1].strip())
+            raise RuntimeError(f"Mojo benchmark failed to report timing.\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
         mos3_mp_times = []
         for i in range(WARMUP):
-            subprocess.run(
-                [mojo_bin, "run", "-I", ".", bench_mojo],
-                env={**os.environ, "MOTO_PORT": str(port),
-                     "BENCH_KEY": f"bench-mp-mos3-{i}.bin", "NUM_PARTS": "3", "PART_SIZE_MB": "5"},
-                capture_output=True, text=True, timeout=120,
-                cwd=PROJECT_ROOT,
-            )
+            _run_mojo_mp(f"warmup-{i}")
         for i in range(ITERATIONS):
-            t0 = time.perf_counter()
-            subprocess.run(
-                [mojo_bin, "run", "-I", ".", bench_mojo],
-                env={**os.environ, "MOTO_PORT": str(port),
-                     "BENCH_KEY": f"bench-mp-mos3-timed-{i}.bin", "NUM_PARTS": "3", "PART_SIZE_MB": "5"},
-                capture_output=True, text=True, timeout=120,
-                cwd=PROJECT_ROOT,
-            )
-            elapsed = time.perf_counter() - t0
-            mos3_mp_times.append(elapsed)
+            ms = _run_mojo_mp(f"timed-{i}")
+            mos3_mp_times.append(ms / 1000)  # Convert ms to seconds for consistency
 
         # boto3 multipart
         boto3_mp_times = []
-        # Create the multipart data once
         mp_data = generate_data(3 * 5 * 1024 * 1024)  # 15 MB
         for i in range(WARMUP):
             boto3_client.put_object(
-                Bucket=BUCKET, Key=f"bench-mp-boto3-{i}.bin", Body=mp_data
+                Bucket=BUCKET, Key=f"bench-mp-boto3-warmup-{i}.bin", Body=mp_data
             )
         for i in range(ITERATIONS):
             _, elapsed = time_operation(
-                lambda: boto3_client.put_object(
-                    Bucket=BUCKET, Key=f"bench-mp-boto3-timed-{i}.bin", Body=mp_data
+                lambda key=f"bench-mp-boto3-timed-{i}.bin": boto3_client.put_object(
+                    Bucket=BUCKET, Key=key, Body=mp_data
                 )
             )
             boto3_mp_times.append(elapsed)
