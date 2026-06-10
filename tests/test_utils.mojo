@@ -12,8 +12,9 @@ def test_hex_encode_hello() raises:
 
 
 def test_hex_encode_binary() raises:
-    var result = hex_encode("\x00\xff")
-    assert_equal(result, "00ff")
+    # \x00 is valid UTF-8 (null byte); \xff in nightly gets UTF-8 encoded
+    var result = hex_encode("\x00\x7f")
+    assert_equal(result, "007f")
 
 
 def test_uri_encode_simple() raises:
