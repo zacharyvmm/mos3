@@ -1,6 +1,6 @@
 from std.testing import assert_equal, assert_true
 from mos3_signing.credentials import S3Credentials, SignOptions
-from mos3_signing.signing import sign_request, _sha256_hex
+from mos3_signing.signing import sign_request, _sha256_hex, presigned_get, presigned_put
 
 
 def test_sha256_empty() raises:
@@ -118,6 +118,56 @@ def test_sign_request_missing_credentials() raises:
         pass  # Expected
 
 
+def test_presigned_get_url() raises:
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="s3.amazonaws.com",
+        bucket="example-bucket",
+    )
+    var url = presigned_get(creds, "/test.txt", expires_in=3600)
+    # Verify all required query params are present
+    assert_true("X-Amz-Algorithm=AWS4-HMAC-SHA256" in url)
+    assert_true("X-Amz-Credential=AKIAIO...MPLE" in url)
+    assert_true("X-Amz-Date=" in url)
+    assert_true("X-Amz-Expires=3600" in url)
+    assert_true("X-Amz-SignedHeaders=host" in url)
+    assert_true("X-Amz-Signature=" in url)
+    assert_true("https://" in url)
+    assert_true("/test.txt?" in url)
+
+def test_presigned_put_url() raises:
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="s3.amazonaws.com",
+        bucket="example-bucket",
+    )
+    var url = presigned_put(creds, "/upload.txt", expires_in=7200, content_type="text/plain")
+    # Verify all required query params
+    assert_true("X-Amz-Algorithm=AWS4-HMAC-SHA256" in url)
+    assert_true("X-Amz-Credential=" in url)
+    assert_true("X-Amz-Expires=7200" in url)
+    assert_true("X-Amz-SignedHeaders=" in url)
+    # Content-type should appear in signed headers
+    assert_true("content-type" in url)
+    assert_true("X-Amz-Signature=" in url)
+    assert_true("https://" in url)
+
+def test_presigned_url_with_session_token() raises:
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="s3.amazonaws.com",
+        session_token="FQoGZXIvYXdzE...",
+    )
+    var url = presigned_get(creds, "/test.txt")
+    assert_true("X-Amz-Security-Token=" in url)
+
+
 def main() raises:
     test_sha256_empty()
     test_sign_request_basic()
@@ -127,4 +177,7 @@ def main() raises:
     test_sign_request_with_session_token()
     test_sign_request_invalid_method()
     test_sign_request_missing_credentials()
+    test_presigned_get_url()
+    test_presigned_put_url()
+    test_presigned_url_with_session_token()
     print("All signing tests passed!")

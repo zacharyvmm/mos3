@@ -38,6 +38,117 @@ def _hmac_sha256(key_hex: String, data: String) raises -> String:
 # ── AWS Signature V4 core ───────────────────────────────────────
 
 
+# ── Presigned URL generation ────────────────────────────────────
+
+
+def presigned_get(credentials: S3Credentials, path: String, expires_in: Int = 3600) raises -> String:
+    """Generate a presigned GET URL for temporary S3 object access."""
+    return _presigned_url(credentials, path, "GET", expires_in, "")
+
+
+def presigned_put(credentials: S3Credentials, path: String, expires_in: Int = 3600, content_type: String = "") raises -> String:
+    """Generate a presigned PUT URL for uploading to S3."""
+    return _presigned_url(credentials, path, "PUT", expires_in, content_type)
+
+
+def _presigned_url(
+    credentials: S3Credentials,
+    path: String,
+    method: String,
+    expires_in: Int,
+    content_type: String,
+) raises -> String:
+    """Core presigned URL builder for GET and PUT."""
+    # Validate credentials
+    if credentials.access_key_id == "" or credentials.secret_access_key == "":
+        raise Error(String("Missing required S3 credentials"))
+
+    # Get current UTC time
+    var datetime = Python.import_module("datetime")
+    var now = datetime.datetime.now(datetime.timezone.utc)
+    var amz_date = String(py=now.strftime("%Y%m%dT%H%M%SZ"))
+    var date_stamp = String(py=now.strftime("%Y%m%d"))
+
+    # Build host
+    var host = credentials.endpoint
+    if credentials.virtual_hosted_style and credentials.bucket != "":
+        host = credentials.bucket + "." + credentials.endpoint
+
+    # Build full path
+    var raw_path = path
+    if not raw_path.startswith("/"):
+        raw_path = "/" + raw_path
+    if not credentials.virtual_hosted_style and credentials.bucket != "":
+        raw_path = "/" + credentials.bucket + raw_path
+
+    # Canonical URI
+    var canonical_uri = uri_encode(raw_path, encode_slash=False)
+    if not canonical_uri.startswith("/"):
+        canonical_uri = "/" + canonical_uri
+
+    # Signed headers (alphabetical: content-type before host)
+    var signed_headers: String
+    if content_type != "":
+        signed_headers = "content-type;host"
+    else:
+        signed_headers = "host"
+
+    # Build query params for the canonical request
+    var credential_scope = date_stamp + "/" + credentials.region + "/s3/aws4_request"
+    var credential_value = credentials.access_key_id + "/" + credential_scope
+
+    # Convert expires_in to string (use Python for Int→String)
+    var expires_str = String(py=PythonObject(expires_in).__str__())
+
+    # Canonical query string — params in alphabetical order, values URI-encoded
+    var canonical_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    canonical_query += "&X-Amz-Credential=" + uri_encode(credential_value, encode_slash=True)
+    canonical_query += "&X-Amz-Date=" + amz_date
+    canonical_query += "&X-Amz-Expires=" + expires_str
+    if credentials.session_token != "":
+        canonical_query += "&X-Amz-Security-Token=" + uri_encode(credentials.session_token, encode_slash=True)
+    canonical_query += "&X-Amz-SignedHeaders=" + uri_encode(signed_headers, encode_slash=True)
+
+    # Content hash is always UNSIGNED-PAYLOAD for presigned URLs
+    var content_hash = "UNSIGNED-PAYLOAD"
+
+    # Canonical headers (alphabetical order)
+    var canonical_headers: String
+    if content_type != "":
+        canonical_headers = "content-type:" + content_type + "\nhost:" + host + "\n"
+    else:
+        canonical_headers = "host:" + host + "\n"
+
+    # Build canonical request
+    var canonical_request = method + "\n"
+    canonical_request += canonical_uri + "\n"
+    canonical_request += canonical_query + "\n"
+    canonical_request += canonical_headers + "\n"
+    canonical_request += signed_headers + "\n"
+    canonical_request += content_hash
+
+    # Build string-to-sign (same as normal V4)
+    var string_to_sign = "AWS4-HMAC-SHA256\n"
+    string_to_sign += amz_date + "\n"
+    string_to_sign += credential_scope + "\n"
+    string_to_sign += _sha256_hex(canonical_request)
+
+    # Compute signing key via HMAC chain
+    var k_date = _hmac_sha256(hex_encode("AWS4" + credentials.secret_access_key), date_stamp)
+    var k_region = _hmac_sha256(k_date, credentials.region)
+    var k_service = _hmac_sha256(k_region, "s3")
+    var k_signing = _hmac_sha256(k_service, "aws4_request")
+    var signature = _hmac_sha256(k_signing, string_to_sign)
+
+    # Build final URL query string (canonical + signature appended)
+    var query_string = canonical_query + "&X-Amz-Signature=" + signature
+
+    # Build final URL
+    var scheme = "http" if credentials.insecure_http else "https"
+    var url = scheme + "://" + host + canonical_uri + "?" + query_string
+    return url
+
+
 def sign_request(credentials: S3Credentials, options: SignOptions) raises -> SignResult:
     """
     Sign an S3 request with AWS Signature V4.
