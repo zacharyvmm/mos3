@@ -1,38 +1,14 @@
 """
 AWS Signature V4 implementation.
-Uses Python hashlib for SHA256/HMAC-SHA256 (Mojo has no native crypto).
+SHA256 is pure Mojo. HMAC-SHA256 uses Python (called only once per sign).
 The canonical request logic is pure Mojo.
 """
 from std.python import Python, PythonObject
 from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
 from mos3_signing.utils import hex_encode, uri_encode
 from mos3_signing.error import S3Error
-
-
-# ── Crypto helpers (Python-backed) ──────────────────────────────
-
-
-def _sha256_hex(data: String) raises -> String:
-    """Compute SHA256 hash of data, return lowercase hex string."""
-    var hashlib = Python.import_module("hashlib")
-    var py_data = PythonObject(data)
-    var h = hashlib.sha256(py_data.encode("utf-8"))
-    return String(py=h.hexdigest())
-
-
-def _hmac_sha256(key_hex: String, data: String) raises -> String:
-    """
-    Compute HMAC-SHA256(key_hex, data).
-    key_hex is the hex-encoded key (from previous HMAC step).
-    Returns lowercase hex string.
-    """
-    var hashlib = Python.import_module("hashlib")
-    var hmac = Python.import_module("hmac")
-    # Decode hex key to raw bytes
-    var raw_key = Python.evaluate("bytes.fromhex")(key_hex)
-    var py_data = PythonObject(data)
-    var h = hmac.new(raw_key, py_data.encode("utf-8"), hashlib.sha256)
-    return String(py=h.hexdigest())
+from mos3_signing.crypto_sha256 import sha256 as _sha256_hex
+from mos3_signing.crypto import hmac_sha256_hex_key as _hmac_sha256
 
 
 # ── AWS Signature V4 core ───────────────────────────────────────
