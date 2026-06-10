@@ -1,6 +1,6 @@
 """
 S3Client — the main entry point for S3 operations.
-Uses Python stdlib http.client for HTTP transport (no extra deps).
+Uses flare's HttpClient for HTTP transport (no Python http.client).
 """
 from std.python import Python, PythonObject
 from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
@@ -10,6 +10,44 @@ from mos3.types import StatSuccess, GetSuccess, PutSuccess, DeleteSuccess, ListO
 from mos3.xml_parser import parse_list_objects_v2, parse_s3_error
 from mos3.stream.upload import MultipartUpload, PartInfo
 from std.collections import Dict
+
+from flare.http import HttpClient, Request
+from flare.http.response import Response as FlareResponse
+from flare.http.headers import HeaderMap
+
+
+# ── Internal HTTP response wrapper ───────────────────────────────
+
+@fieldwise_init
+struct HttpResponse(Movable):
+    """Wraps a flare HTTP response with S3-specific helpers."""
+    var _resp: FlareResponse
+
+    def status(self) -> Int:
+        """Return the HTTP status code."""
+        return self._resp.status
+
+    def text(self) -> String:
+        """Decode the body as a UTF-8 string."""
+        return self._resp.text()
+
+    def header(self, name: String, default: String = "") -> String:
+        """Case-insensitive header lookup. Returns default if missing."""
+        var val = self._resp.headers.get(name)
+        if val == "":
+            return default
+        return val
+
+    def all_headers(self) -> Dict[String, String]:
+        """Extract all response headers into a Dict."""
+        var result = Dict[String, String]()
+        for i in range(len(self._resp.headers._keys)):
+            result[self._resp.headers._keys[i]] = self._resp.headers._values[i]
+        return result^
+
+    def body_bytes(self) -> List[UInt8]:
+        """Return the raw response body bytes."""
+        return self._resp.body
 
 
 @fieldwise_init
@@ -37,18 +75,18 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def stat(self, path: String) raises -> StatSuccess:
         """Get object metadata without downloading the body."""
         var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200:
             return StatSuccess(
-                size=Int(String(py=_get_response_header(response, "Content-Length", "0"))),
-                etag=String(py=_get_response_header(response, "ETag", "")),
-                last_modified=String(py=_get_response_header(response, "Last-Modified", "")),
-                content_type=String(py=_get_response_header(response, "Content-Type", "")),
+                size=_parse_int(response.header("Content-Length", "0")),
+                etag=response.header("ETag", ""),
+                last_modified=response.header("Last-Modified", ""),
+                content_type=response.header("Content-Type", ""),
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected stat response"))
 
     # ── get (GET) ───────────────────────────────────────────────
@@ -56,18 +94,16 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def get(self, path: String) raises -> GetSuccess:
         """Download an object. Returns body as String."""
         var response = _do_s3_request_with_retry(self, path, "GET", body="")
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200:
-            var body_bytes = response.read()
-            var body = String(py=body_bytes.decode("utf-8"))
             return GetSuccess(
-                etag=String(py=_get_response_header(response, "ETag", "")),
-                body=body,
+                etag=response.header("ETag", ""),
+                body=response.text(),
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected get response"))
 
     # ── put (PUT) ───────────────────────────────────────────────
@@ -86,10 +122,10 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
             content_hash=content_hash,
             content_type=content_type,
         )
-        var status = Int(py=_get_status(response))
+        var status = response.status()
         if status == 200:
-            return PutSuccess(etag=String(py=_get_response_header(response, "ETag", "")))
-        _raise_http_error_obj(response)
+            return PutSuccess(etag=response.header("ETag", ""))
+        _raise_http_error(response)
         raise Error(String("Unexpected put response"))
 
     # ── delete (DELETE) ─────────────────────────────────────────
@@ -97,12 +133,12 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def delete(self, path: String) raises -> DeleteSuccess:
         """Delete an object. Returns DeleteSuccess even if already deleted."""
         var response = _do_s3_request_with_retry(self, path, "DELETE", body="")
-        var status = Int(py=_get_status(response))
+        var status = response.status()
         if status == 200 or status == 204:
             return DeleteSuccess()
         if status == 404:
             return DeleteSuccess()
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected delete response"))
 
     # ── list_objects ────────────────────────────────────────────
@@ -130,15 +166,14 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
             body="",
             search_params=search_params,
         )
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200:
-            var body_bytes = response.read()
-            var xml_body = String(py=body_bytes.decode("utf-8"))
+            var xml_body = response.text()
             return parse_list_objects_v2(xml_body)
         if status == 404:
             raise Error(String("NoSuchBucket: The specified bucket does not exist."))
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected list response"))
 
     # ── create_bucket ───────────────────────────────────────────
@@ -146,8 +181,7 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def create_bucket(self) raises -> Bool:
         """Create the configured bucket. Returns True on success."""
         var response = _do_s3_request_with_retry(self, "", "PUT", body="")
-        var status = Int(py=_get_status(response))
-        return status == 200
+        return response.status() == 200
 
     # ── copy_object ─────────────────────────────────────────────
 
@@ -169,6 +203,9 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
                 insecure_http=self.credentials.insecure_http,
             )
 
+        var extra_headers = Dict[String, String]()
+        extra_headers["x-amz-copy-source"] = copy_source
+
         var empty_hash = _sha256_hex("")
 
         var config = self.retry_config
@@ -176,38 +213,23 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
 
         while True:
             try:
-                var sign_result = sign_request(dest_creds, SignOptions.create(
-                    path=dst,
-                    method="PUT",
+                var response = _do_s3_request(
+                    dest_creds, dst, "PUT",
+                    body="",
                     content_hash=empty_hash,
-                ))
-
-                var (host, port_py, path_and_query) = _parse_url(sign_result.url)
-                var port = Int(py=port_py)
-                var http_client = Python.import_module("http.client")
-                var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
-
-                var py_headers = Python.dict()
-                py_headers["Authorization"] = sign_result.authorization_header
-                py_headers["x-amz-content-sha256"] = sign_result.content_sha256
-                py_headers["x-amz-date"] = sign_result.amz_date
-                py_headers["x-amz-copy-source"] = PythonObject(copy_source)
-                if sign_result.security_token_header != "":
-                    py_headers["x-amz-security-token"] = sign_result.security_token_header
-
-                conn.request("PUT", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
-                var response = conn.getresponse()
-                var status = Int(py=_get_status(response))
+                    extra_headers=extra_headers,
+                )
+                var status = response.status()
                 if status == 200:
                     return True
                 # Non-200 status
                 if status < 500 or attempt >= config.max_retries:
-                    _raise_http_error_obj(response)
+                    _raise_http_error(response)
                     raise Error(String("Unexpected copy response"))
                 # 5xx with retries remaining - fall through to sleep
             except e:
                 if attempt >= config.max_retries:
-                    raise e
+                    raise e^
 
             _sleep_backoff(config, attempt)
             attempt += 1
@@ -237,11 +259,11 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
             content_type=content_type,
             extra_headers=extra_headers,
         )
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200:
-            return PutSuccess(etag=String(py=_get_response_header(response, "ETag", "")))
-        _raise_http_error_obj(response)
+            return PutSuccess(etag=response.header("ETag", ""))
+        _raise_http_error(response)
         raise Error(String("Unexpected put_with_metadata response"))
 
     # ── put_auto ─────────────────────────────────────────────────
@@ -383,13 +405,13 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def head_object(self, path: String) raises -> Dict[String, String]:
         """Return ALL response headers for an object."""
         var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200:
-            return _get_all_headers(response)
+            return response.all_headers()
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected head_object response"))
 
     # ── object_exists ───────────────────────────────────────────
@@ -397,16 +419,14 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
     def object_exists(self, path: String) raises -> Bool:
         """Return True if the object exists."""
         var response = _do_s3_request_with_retry(self, path, "HEAD", body="")
-        var status = Int(py=_get_status(response))
-        return status == 200
+        return response.status() == 200
 
     # ── bucket_exists ───────────────────────────────────────────
 
     def bucket_exists(self) raises -> Bool:
         """Return True if the bucket exists (HEAD to bucket root)."""
         var response = _do_s3_request_with_retry(self, "", "HEAD", body="")
-        var status = Int(py=_get_status(response))
-        return status == 200
+        return response.status() == 200
 
     # ── get_range ───────────────────────────────────────────────
 
@@ -425,44 +445,39 @@ struct S3Client(Movable, ImplicitlyCopyable, Writable):
             body="",
             extra_headers=extra_headers,
         )
-        var status = Int(py=_get_status(response))
+        var status = response.status()
 
         if status == 200 or status == 206:
-            var body_bytes = response.read()
-            var body = String(py=body_bytes.decode("utf-8"))
             return GetSuccess(
-                etag=String(py=_get_response_header(response, "ETag", "")),
-                body=body,
+                etag=response.header("ETag", ""),
+                body=response.text(),
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error_obj(response)
+        _raise_http_error(response)
         raise Error(String("Unexpected get_range response"))
 
 
 # ── Internal helpers ────────────────────────────────────────────
 
 
+def _parse_int(s: String) -> Int:
+    """Parse a string to Int, returning 0 on failure."""
+    if s == "":
+        return 0
+    var result: Int = 0
+    for i in range(s.byte_length()):
+        var c = Int(s.unsafe_ptr()[i])
+        if c < 48 or c > 57:
+            break
+        result = result * 10 + (c - 48)
+    return result
+
+
 def _url_encode(s: String) raises -> String:
     """URL-encode a string using Python's urllib.parse.quote."""
     var urllib = Python.import_module("urllib.parse")
     return String(py=urllib.quote(s, safe=""))
-
-
-def _get_status(response: PythonObject) raises -> PythonObject:
-    """Get status code from response. Works with http.client.HTTPResponse."""
-    return response.status
-
-
-def _get_response_header(response: PythonObject, name: String, default: String) raises -> String:
-    """Get a header from http.client.HTTPResponse."""
-    try:
-        var val = response.getheader(name)
-        if val is None:
-            return default
-        return String(py=val)
-    except:
-        return default
 
 
 def _sleep_backoff(config: RetryConfig, attempt: Int) raises:
@@ -486,7 +501,7 @@ def _do_s3_request_with_retry(
     content_type: String = "",
     search_params: String = "",
     extra_headers: Dict[String, String] = Dict[String, String](),
-) raises -> PythonObject:
+) raises -> HttpResponse:
     """Execute _do_s3_request with retry on 5xx or connection errors."""
     var config = client.retry_config
     var attempt: Int = 0
@@ -501,12 +516,12 @@ def _do_s3_request_with_retry(
                 search_params=search_params,
                 extra_headers=extra_headers,
             )
-            var status = Int(py=_get_status(response))
+            var status = response.status()
             if status < 500:
-                return response
+                return response^
             # 5xx - retry if attempts remain, otherwise return as-is
             if attempt >= config.max_retries:
-                return response  # Let caller handle the 5xx
+                return response^  # Let caller handle the 5xx
         except e:
             # Connection or other error
             if attempt >= config.max_retries:
@@ -525,10 +540,10 @@ def _do_s3_request(
     content_type: String = "",
     search_params: String = "",
     extra_headers: Dict[String, String] = Dict[String, String](),
-) raises -> PythonObject:
+) raises -> HttpResponse:
     """
-    Sign an S3 request and execute it via Python http.client.
-    Returns http.client.HTTPResponse.
+    Sign an S3 request and execute it via flare HttpClient.
+    Returns HttpResponse.
     """
     var hash_val = content_hash
     if hash_val == "":
@@ -542,84 +557,67 @@ def _do_s3_request(
         content_type=content_type,
     ))
 
-    # Parse URL to extract host, port, path+query
-    var (host, port_py, path_and_query) = _parse_url(sign_result.url)
-    var port = Int(py=port_py)
+    # Create flare HttpClient and Request
+    var http_client = HttpClient(timeout_ms=30_000)
+    var req = Request(method=method, url=sign_result.url)
 
-    var http_client = Python.import_module("http.client")
-    var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
-
-    # Build headers dict
-    var py_headers = Python.dict()
-    py_headers["Authorization"] = sign_result.authorization_header
-    py_headers["x-amz-content-sha256"] = sign_result.content_sha256
-    py_headers["x-amz-date"] = sign_result.amz_date
+    # Set AWS signing headers
+    req.headers.set("Authorization", sign_result.authorization_header)
+    req.headers.set("x-amz-content-sha256", sign_result.content_sha256)
+    req.headers.set("x-amz-date", sign_result.amz_date)
     if sign_result.security_token_header != "":
-        py_headers["x-amz-security-token"] = sign_result.security_token_header
+        req.headers.set("x-amz-security-token", sign_result.security_token_header)
     if content_type != "":
-        py_headers["Content-Type"] = content_type
+        req.headers.set("Content-Type", content_type)
 
     # Add extra headers
     for entry in extra_headers.items():
-        py_headers[entry.key] = PythonObject(entry.value)
+        req.headers.set(entry.key, entry.value)
 
-    var body_bytes = Python.none()
+    # Set body (convert String to List[UInt8])
     if body != "":
-        body_bytes = PythonObject(body).encode("utf-8")
-    else:
-        body_bytes = PythonObject("").encode("utf-8")
+        var body_bytes = List[UInt8]()
+        var bb = body.as_bytes()
+        for i in range(len(bb)):
+            body_bytes.append(bb[i])
+        req.body = body_bytes^
 
-    conn.request(method, path_and_query, body=body_bytes, headers=py_headers)
-    var response = conn.getresponse()
-    return response
+    # Send request
+    var resp = http_client.send(req)
 
-
-def _parse_url(url: String) raises -> Tuple[String, PythonObject, String]:
-    """
-    Parse a URL like 'http://host:port/path?query' into (host, port, path+query).
-    Returns Tuple[String, PythonObject, String] where the port PythonObject is an int
-    that Mojo can convert with Int(py=...).
-    """
-    var url_parse = Python.import_module("urllib.parse")
-    var parsed = url_parse.urlparse(url)
-
-    var host = String(py=parsed.hostname)
-    var port = parsed.port
-    if port is None:
-        var scheme = String(py=parsed.scheme)
-        if scheme == "https":
-            port = PythonObject(443)
-        else:
-            port = PythonObject(80)
-
-    var path_and_query = String(py=parsed.path)
-    var query = parsed.query
-    if query is not None and String(py=query) != "":
-        path_and_query += "?" + String(py=query)
-
-    return (host, port, path_and_query)
+    # Wrap in HttpResponse (owns the flare Response)
+    return HttpResponse(_resp=resp^)
 
 
-def _get_all_headers(response: PythonObject) raises -> Dict[String, String]:
+def _get_status(response: HttpResponse) -> Int:
+    """Get status code from HttpResponse."""
+    return response.status()
+
+
+def _get_response_header(response: HttpResponse, name: String, default: String) -> String:
+    """Get a header from HttpResponse. Returns default if missing."""
+    return response.header(name, default)
+
+
+def _get_all_headers(response: HttpResponse) -> Dict[String, String]:
     """Extract all headers from an HTTP response into a Dict."""
-    var result = Dict[String, String]()
-    var headers_list = response.getheaders()
-    for item in headers_list:
-        var key = String(py=item[0])
-        var value = String(py=item[1])
-        result[key] = value
-    return result^
+    return response.all_headers()
 
 
-def _raise_http_error_obj(response: PythonObject) raises:
+def _raise_http_error(response: HttpResponse) raises:
     """Try to parse an S3 error from the response body and raise it."""
     try:
-        var body_bytes = response.read()
-        var body = String(py=body_bytes.decode("utf-8"))
+        var body = response.text()
         if body != "" and "<Error>" in body:
             var (code, message) = parse_s3_error(body)
             raise Error(String(code, ": ", message))
     except e:
         _ = e
-    var status = Int(py=_get_status(response))
-    raise Error(String("S3 request failed with status ", status))
+    raise Error(String("S3 request failed with status ", response.status()))
+
+
+# Backward-compatible alias for upload.mojo which imports _raise_http_error_obj
+def _raise_http_error_obj(response: HttpResponse) raises:
+    """Try to parse an S3 error from the response body and raise it.
+    (Backward-compatible wrapper for upload.mojo.)"""
+    _raise_http_error(response)

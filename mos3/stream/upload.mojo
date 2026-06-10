@@ -83,13 +83,12 @@ struct MultipartUpload(Movable):
             content_type=content_type,
             search_params="uploads",
         )
-        var status = Int(py=_get_status(response))
+        var status = _get_status(response)
         if status != 200:
             _raise_http_error_obj(response)
             raise Error(String("Failed to initiate multipart upload"))
 
-        var body_bytes = response.read()
-        var body = String(py=body_bytes.decode("utf-8"))
+        var body = response.text()
         var upload_id = _extract_xml_tag(body, "UploadId")
         if upload_id == "":
             raise Error(String("No UploadId in initiate response"))
@@ -112,12 +111,12 @@ struct MultipartUpload(Movable):
             content_hash=content_hash,
             search_params=search,
         )
-        var status = Int(py=_get_status(response))
+        var status = _get_status(response)
         if status != 200:
             _raise_http_error_obj(response)
             raise Error(String("Failed to upload part ", part_number))
 
-        var etag = String(py=_get_response_header(response, "ETag", ""))
+        var etag = _get_response_header(response, "ETag", "")
         var part = PartInfo(part_number=part_number, etag=etag)
         self._parts.append(part)
         return part
@@ -256,7 +255,7 @@ struct MultipartUpload(Movable):
             content_type="application/xml",
             search_params=search,
         )
-        var status = Int(py=_get_status(response))
+        var status = _get_status(response)
         return status == 200
 
     def abort(self) raises -> Bool:
@@ -267,7 +266,7 @@ struct MultipartUpload(Movable):
             body="",
             search_params=search,
         )
-        var status = Int(py=_get_status(response))
+        var status = _get_status(response)
         return status == 204
 
     def upload_id_str(self) -> String:
