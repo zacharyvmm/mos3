@@ -48,6 +48,22 @@ struct PresignedPost(Movable, Copyable):
     var fields: Dict[String, String]
 
 
+def _json_escape(s: String) -> String:
+    """Escape a string for safe inclusion in a JSON string value.
+
+    Handles backslash, double-quote, and common control characters.
+    """
+    var result = s
+    # Order matters: escape backslash first so we don't re-escape
+    # the backslashes we just inserted
+    result = result.replace("\\", "\\\\")
+    result = result.replace('"', '\\"')
+    result = result.replace("\n", "\\n")
+    result = result.replace("\r", "\\r")
+    result = result.replace("\t", "\\t")
+    return result
+
+
 def presigned_post(
     credentials: S3Credentials,
     key: String,
@@ -93,41 +109,19 @@ def presigned_post(
     if credentials.session_token != "":
         fields["X-Amz-Security-Token"] = credentials.session_token
 
-    # Build policy JSON document
-    var policy_obj = Python.dict()
-    policy_obj["expiration"] = PythonObject(exp_str)
+    # Build policy JSON document as a String (no Python JSON dependency)
+    # Shape: {"expiration":"...","conditions":[{"bucket":"..."},{"key":"..."},{"acl":"..."},["content-length-range",1,N]]}
+    var policy_json = '{"expiration":"' + exp_str + '","conditions":['
+    policy_json += '{"bucket":"' + _json_escape(credentials.bucket) + '"},'
+    policy_json += '{"key":"' + _json_escape(key) + '"},'
+    policy_json += '{"acl":"' + acl + '"},'
+    var max_len_str = String(py=PythonObject(max_content_length).__str__())
+    policy_json += '["content-length-range",1,' + max_len_str + ']'
+    policy_json += ']}'
 
-    var conditions = Python.evaluate("[]")
-
-    # Condition: bucket must match
-    var bucket_cond = Python.dict()
-    bucket_cond["bucket"] = PythonObject(credentials.bucket)
-    conditions.append(bucket_cond)
-
-    # Condition: key must match exactly
-    var key_cond = Python.dict()
-    key_cond["key"] = PythonObject(key)
-    conditions.append(key_cond)
-
-    # Condition: acl must match
-    var acl_cond = Python.dict()
-    acl_cond["acl"] = PythonObject(acl)
-    conditions.append(acl_cond)
-
-    # Condition: content-length-range (min, max)
-    var range_cond = Python.evaluate("[]")
-    range_cond.append(PythonObject("content-length-range"))
-    range_cond.append(PythonObject(1))
-    range_cond.append(PythonObject(max_content_length))
-    conditions.append(range_cond)
-
-    policy_obj["conditions"] = conditions
-
-    # Convert policy to JSON and base64 encode
-    var json_module = Python.import_module("json")
+    # Base64 encode the policy
     var base64 = Python.import_module("base64")
-    var policy_json = json_module.dumps(policy_obj)
-    var policy_b64 = String(py=base64.b64encode(policy_json.encode("utf-8")).decode("utf-8"))
+    var policy_b64 = String(py=base64.b64encode(PythonObject(policy_json).encode("utf-8")).decode("utf-8"))
 
     # Sign the base64-encoded policy
     var signing_key = _derive_signing_key(credentials.secret_access_key, date_stamp, credentials.region)
