@@ -6,7 +6,7 @@ from mos3_signing.error import S3Error
 
 
 @fieldwise_init
-struct StatSuccess(Movable, Copyable):
+struct StatSuccess(Movable, Copyable, ImplicitlyCopyable):
     """Result of a successful stat (HEAD) request."""
     var size: Int
     var etag: String
@@ -15,14 +15,14 @@ struct StatSuccess(Movable, Copyable):
 
 
 @fieldwise_init
-struct GetSuccess(Movable, Copyable):
+struct GetSuccess(Movable, Copyable, ImplicitlyCopyable):
     """Result of a successful get (GET) request."""
     var etag: String
     var body: String
 
 
 @fieldwise_init
-struct PutSuccess(Movable, Copyable):
+struct PutSuccess(Movable, Copyable, ImplicitlyCopyable):
     """Result of a successful put (PUT) request."""
     var etag: String     # ETag of the uploaded object
 
@@ -36,7 +36,7 @@ struct DeleteSuccess(Movable, Copyable):
 
 
 @fieldwise_init
-struct ListObjectsContents(Movable, Copyable):
+struct ListObjectsContents(Movable, Copyable, ImplicitlyCopyable):
     """A single object in a list-objects response."""
     var key: String
     var etag: String
