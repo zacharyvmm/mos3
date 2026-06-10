@@ -4,6 +4,7 @@ SHA256 is pure Mojo. HMAC-SHA256 uses Python (called only once per sign).
 The canonical request logic is pure Mojo.
 """
 from std.python import Python, PythonObject
+from std.collections import Dict
 from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
 from mos3_signing.utils import hex_encode, uri_encode
 from mos3_signing.error import S3Error
@@ -12,6 +13,19 @@ from mos3_signing.crypto import hmac_sha256_hex_key as _hmac_sha256
 
 
 # ── AWS Signature V4 core ───────────────────────────────────────
+
+
+def _derive_signing_key(secret_access_key: String, date_stamp: String, region: String) raises -> String:
+    """Derive the AWS V4 signing key via the HMAC chain.
+    
+    Steps: kDate→kRegion→kService→kSigning.
+    Returns the final hex-encoded signing key.
+    """
+    var k_date = _hmac_sha256(hex_encode("AWS4" + secret_access_key), date_stamp)
+    var k_region = _hmac_sha256(k_date, region)
+    var k_service = _hmac_sha256(k_region, "s3")
+    var k_signing = _hmac_sha256(k_service, "aws4_request")
+    return k_signing
 
 
 # ── Presigned URL generation ────────────────────────────────────
@@ -25,6 +39,104 @@ def presigned_get(credentials: S3Credentials, path: String, expires_in: Int = 36
 def presigned_put(credentials: S3Credentials, path: String, expires_in: Int = 3600, content_type: String = "") raises -> String:
     """Generate a presigned PUT URL for uploading to S3."""
     return _presigned_url(credentials, path, "PUT", expires_in, content_type)
+
+
+@fieldwise_init
+struct PresignedPost(Movable, Copyable):
+    """A presigned POST form for browser-based uploads to S3."""
+    var url: String
+    var fields: Dict[String, String]
+
+
+def presigned_post(
+    credentials: S3Credentials,
+    key: String,
+    expires_in: Int = 3600,
+    max_content_length: Int = 10485760,  # 10 MB
+    acl: String = "private",
+) raises -> PresignedPost:
+    """Generate a presigned POST form for browser uploads to S3.
+
+    Returns a PresignedPost with url and fields dict.
+    The fields can be used in an HTML form to upload files directly.
+    """
+    # Validate credentials
+    if credentials.access_key_id == "" or credentials.secret_access_key == "":
+        raise Error(String("Missing required S3 credentials"))
+
+    # Get current UTC time
+    var datetime = Python.import_module("datetime")
+    var now = datetime.datetime.now(datetime.timezone.utc)
+    var expiration = now + datetime.timedelta(seconds=PythonObject(expires_in))
+    var exp_str = String(py=expiration.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    var amz_date = String(py=now.strftime("%Y%m%dT%H%M%SZ"))
+    var date_stamp = String(py=now.strftime("%Y%m%d"))
+
+    var credential_scope = date_stamp + "/" + credentials.region + "/s3/aws4_request"
+    var credential = credentials.access_key_id + "/" + credential_scope
+
+    # Build URL
+    var scheme = "http" if credentials.insecure_http else "https"
+    var host = credentials.endpoint
+    if not credentials.virtual_hosted_style and credentials.bucket != "":
+        host = host + "/" + credentials.bucket
+    var url = scheme + "://" + host + "/"
+
+    # Build fields dict
+    var fields = Dict[String, String]()
+    fields["key"] = key
+    fields["acl"] = acl
+    fields["X-Amz-Algorithm"] = "AWS4-HMAC-SHA256"
+    fields["X-Amz-Credential"] = credential
+    fields["X-Amz-Date"] = amz_date
+
+    if credentials.session_token != "":
+        fields["X-Amz-Security-Token"] = credentials.session_token
+
+    # Build policy JSON document
+    var policy_obj = Python.dict()
+    policy_obj["expiration"] = PythonObject(exp_str)
+
+    var conditions = Python.evaluate("[]")
+
+    # Condition: bucket must match
+    var bucket_cond = Python.dict()
+    bucket_cond["bucket"] = PythonObject(credentials.bucket)
+    conditions.append(bucket_cond)
+
+    # Condition: key must match exactly
+    var key_cond = Python.dict()
+    key_cond["key"] = PythonObject(key)
+    conditions.append(key_cond)
+
+    # Condition: acl must match
+    var acl_cond = Python.dict()
+    acl_cond["acl"] = PythonObject(acl)
+    conditions.append(acl_cond)
+
+    # Condition: content-length-range (min, max)
+    var range_cond = Python.evaluate("[]")
+    range_cond.append(PythonObject("content-length-range"))
+    range_cond.append(PythonObject(1))
+    range_cond.append(PythonObject(max_content_length))
+    conditions.append(range_cond)
+
+    policy_obj["conditions"] = conditions
+
+    # Convert policy to JSON and base64 encode
+    var json_module = Python.import_module("json")
+    var base64 = Python.import_module("base64")
+    var policy_json = json_module.dumps(policy_obj)
+    var policy_b64 = String(py=base64.b64encode(policy_json.encode("utf-8")).decode("utf-8"))
+
+    # Sign the base64-encoded policy
+    var signing_key = _derive_signing_key(credentials.secret_access_key, date_stamp, credentials.region)
+    var signature = _hmac_sha256(signing_key, policy_b64)
+
+    fields["policy"] = policy_b64
+    fields["X-Amz-Signature"] = signature
+
+    return PresignedPost(url=url, fields=fields^)
 
 
 def _presigned_url(
@@ -110,11 +222,8 @@ def _presigned_url(
     string_to_sign += _sha256_hex(canonical_request)
 
     # Compute signing key via HMAC chain
-    var k_date = _hmac_sha256(hex_encode("AWS4" + credentials.secret_access_key), date_stamp)
-    var k_region = _hmac_sha256(k_date, credentials.region)
-    var k_service = _hmac_sha256(k_region, "s3")
-    var k_signing = _hmac_sha256(k_service, "aws4_request")
-    var signature = _hmac_sha256(k_signing, string_to_sign)
+    var signing_key = _derive_signing_key(credentials.secret_access_key, date_stamp, credentials.region)
+    var signature = _hmac_sha256(signing_key, string_to_sign)
 
     # Build final URL query string (canonical + signature appended)
     var query_string = canonical_query + "&X-Amz-Signature=" + signature
@@ -205,13 +314,9 @@ def sign_request(credentials: S3Credentials, options: SignOptions) raises -> Sig
     string_to_sign += _sha256_hex(canonical_request)
 
     # Compute signing key via HMAC chain
-    # Step 1: key = raw bytes of "AWS4<secret>", data = date_stamp
     # We hex-encode the key so _hmac_sha256 can decode it back to raw bytes
-    var k_date = _hmac_sha256(hex_encode("AWS4" + credentials.secret_access_key), date_stamp)
-    var k_region = _hmac_sha256(k_date, credentials.region)
-    var k_service = _hmac_sha256(k_region, "s3")
-    var k_signing = _hmac_sha256(k_service, "aws4_request")
-    var signature = _hmac_sha256(k_signing, string_to_sign)
+    var signing_key = _derive_signing_key(credentials.secret_access_key, date_stamp, credentials.region)
+    var signature = _hmac_sha256(signing_key, string_to_sign)
 
     # Build authorization header
     var authorization = "AWS4-HMAC-SHA256 "

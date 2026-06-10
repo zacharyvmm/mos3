@@ -11,9 +11,7 @@ import time
 import sys
 import os
 import subprocess
-import io
 import random
-import string
 
 # Add project root to path so we can import mos3_py
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,7 +20,6 @@ sys.path.insert(0, PROJECT_ROOT)
 import mos3_py
 import boto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
 from moto.server import ThreadedMotoServer
 
 # ── Constants ────────────────────────────────────────────────────
@@ -289,19 +286,54 @@ def main():
             ms = _run_mojo_mp(f"timed-{i}")
             mos3_mp_times.append(ms / 1000)  # Convert ms to seconds for consistency
 
-        # boto3 multipart
+        # boto3 multipart (proper multipart upload, not put_object)
         boto3_mp_times = []
-        mp_data = generate_data(3 * 5 * 1024 * 1024)  # 15 MB
+        mp_part_data = generate_data(5 * 1024 * 1024)  # 5 MB per part
         for i in range(WARMUP):
-            boto3_client.put_object(
-                Bucket=BUCKET, Key=f"bench-mp-boto3-warmup-{i}.bin", Body=mp_data
+            # Use proper multipart upload for fair comparison
+            mpu = boto3_client.create_multipart_upload(
+                Bucket=BUCKET, Key=f"bench-mp-boto3-warmup-{i}.bin"
+            )
+            upload_id = mpu["UploadId"]
+            parts = []
+            for pn in range(1, 4):  # 3 parts
+                part = boto3_client.upload_part(
+                    Bucket=BUCKET,
+                    Key=f"bench-mp-boto3-warmup-{i}.bin",
+                    PartNumber=pn,
+                    UploadId=upload_id,
+                    Body=mp_part_data,
+                )
+                parts.append({"PartNumber": pn, "ETag": part["ETag"]})
+            boto3_client.complete_multipart_upload(
+                Bucket=BUCKET,
+                Key=f"bench-mp-boto3-warmup-{i}.bin",
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
             )
         for i in range(ITERATIONS):
-            _, elapsed = time_operation(
-                lambda key=f"bench-mp-boto3-timed-{i}.bin": boto3_client.put_object(
-                    Bucket=BUCKET, Key=key, Body=mp_data
+            def boto3_mp_upload(key_suffix):
+                mpu = boto3_client.create_multipart_upload(
+                    Bucket=BUCKET, Key=f"bench-mp-boto3-timed-{key_suffix}.bin"
                 )
-            )
+                upload_id = mpu["UploadId"]
+                parts = []
+                for pn in range(1, 4):  # 3 parts
+                    part = boto3_client.upload_part(
+                        Bucket=BUCKET,
+                        Key=f"bench-mp-boto3-timed-{key_suffix}.bin",
+                        PartNumber=pn,
+                        UploadId=upload_id,
+                        Body=mp_part_data,
+                    )
+                    parts.append({"PartNumber": pn, "ETag": part["ETag"]})
+                boto3_client.complete_multipart_upload(
+                    Bucket=BUCKET,
+                    Key=f"bench-mp-boto3-timed-{key_suffix}.bin",
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                )
+            _, elapsed = time_operation(boto3_mp_upload, str(i))
             boto3_mp_times.append(elapsed)
 
         mos3_mp_avg_ms = (sum(mos3_mp_times) / len(mos3_mp_times)) * 1000

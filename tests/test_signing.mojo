@@ -1,6 +1,6 @@
 from std.testing import assert_equal, assert_true
 from mos3_signing.credentials import S3Credentials, SignOptions
-from mos3_signing.signing import sign_request, _sha256_hex, presigned_get, presigned_put
+from mos3_signing.signing import sign_request, _sha256_hex, presigned_get, presigned_put, presigned_post
 
 
 def test_sha256_empty() raises:
@@ -156,6 +156,29 @@ def test_presigned_put_url() raises:
     assert_true("X-Amz-Signature=" in url)
     assert_true("https://" in url)
 
+def test_presigned_post() raises:
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="s3.amazonaws.com",
+        bucket="mybucket",
+    )
+    var result = presigned_post(creds, "uploads/file.txt", 3600)
+    assert_true(result.url != "")
+    assert_true("key" in result.fields)
+    assert_true("policy" in result.fields)
+    assert_true("X-Amz-Signature" in result.fields)
+    assert_true("acl" in result.fields)
+    assert_true("X-Amz-Algorithm" in result.fields)
+    assert_true("X-Amz-Credential" in result.fields)
+    assert_true("X-Amz-Date" in result.fields)
+    # Verify field values
+    assert_true(result.fields["key"] == "uploads/file.txt")
+    assert_true(result.fields["acl"] == "private")
+    assert_true(result.fields["X-Amz-Algorithm"] == "AWS4-HMAC-SHA256")
+
+
 def test_presigned_url_with_session_token() raises:
     var creds = S3Credentials.create(
         access_key_id="AKIAIO...MPLE",
@@ -179,5 +202,6 @@ def main() raises:
     test_sign_request_missing_credentials()
     test_presigned_get_url()
     test_presigned_put_url()
+    test_presigned_post()
     test_presigned_url_with_session_token()
     print("All signing tests passed!")
