@@ -51,7 +51,7 @@ def sign_request(credentials: S3Credentials, options: SignOptions) raises -> Sig
 
     # Validate method
     var method_upper = options.method
-    if method_upper not in ("GET", "PUT", "HEAD", "DELETE"):
+    if method_upper not in ("GET", "PUT", "HEAD", "DELETE", "POST"):
         raise Error(String("Invalid HTTP method: ", options.method))
 
     # Get current UTC time

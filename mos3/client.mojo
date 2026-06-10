@@ -1,6 +1,6 @@
 """
 S3Client — the main entry point for S3 operations.
-Uses Python stdlib urllib for HTTP transport (no extra deps).
+Uses Python stdlib http.client for HTTP transport (no extra deps).
 """
 from std.python import Python, PythonObject
 from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
@@ -23,18 +23,18 @@ struct S3Client(Movable):
     def stat(self, path: String) raises -> StatSuccess:
         """Get object metadata without downloading the body."""
         var response = _do_s3_request(self.credentials, path, "HEAD", body="")
-        var status = Int(py=response.getcode())
+        var status = Int(py=_get_status(response))
 
         if status == 200:
             return StatSuccess(
-                size=Int(String(py=_get_header(response, "Content-Length", "0"))),
-                etag=String(py=_get_header(response, "ETag", "")),
-                last_modified=String(py=_get_header(response, "Last-Modified", "")),
-                content_type=String(py=_get_header(response, "Content-Type", "")),
+                size=Int(String(py=_get_response_header(response, "Content-Length", "0"))),
+                etag=String(py=_get_response_header(response, "ETag", "")),
+                last_modified=String(py=_get_response_header(response, "Last-Modified", "")),
+                content_type=String(py=_get_response_header(response, "Content-Type", "")),
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error(response)
+        _raise_http_error_obj(response)
         raise Error(String("Unexpected stat response"))
 
     # ── get (GET) ───────────────────────────────────────────────
@@ -42,18 +42,18 @@ struct S3Client(Movable):
     def get(self, path: String) raises -> GetSuccess:
         """Download an object. Returns body as String."""
         var response = _do_s3_request(self.credentials, path, "GET", body="")
-        var status = Int(py=response.getcode())
+        var status = Int(py=_get_status(response))
 
         if status == 200:
             var body_bytes = response.read()
             var body = String(py=body_bytes.decode("utf-8"))
             return GetSuccess(
-                etag=String(py=_get_header(response, "ETag", "")),
+                etag=String(py=_get_response_header(response, "ETag", "")),
                 body=body,
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
-        _raise_http_error(response)
+        _raise_http_error_obj(response)
         raise Error(String("Unexpected get response"))
 
     # ── put (PUT) ───────────────────────────────────────────────
@@ -72,10 +72,10 @@ struct S3Client(Movable):
             content_hash=content_hash,
             content_type=content_type,
         )
-        var status = Int(py=response.getcode())
+        var status = Int(py=_get_status(response))
         if status == 200:
-            return PutSuccess(etag=String(py=_get_header(response, "ETag", "")))
-        _raise_http_error(response)
+            return PutSuccess(etag=String(py=_get_response_header(response, "ETag", "")))
+        _raise_http_error_obj(response)
         raise Error(String("Unexpected put response"))
 
     # ── delete (DELETE) ─────────────────────────────────────────
@@ -83,12 +83,12 @@ struct S3Client(Movable):
     def delete(self, path: String) raises -> DeleteSuccess:
         """Delete an object. Returns DeleteSuccess even if already deleted."""
         var response = _do_s3_request(self.credentials, path, "DELETE", body="")
-        var status = Int(py=response.getcode())
+        var status = Int(py=_get_status(response))
         if status == 200 or status == 204:
             return DeleteSuccess()
         if status == 404:
             return DeleteSuccess()
-        _raise_http_error(response)
+        _raise_http_error_obj(response)
         raise Error(String("Unexpected delete response"))
 
     # ── list_objects ────────────────────────────────────────────
@@ -116,7 +116,7 @@ struct S3Client(Movable):
             body="",
             search_params=search_params,
         )
-        var status = Int(py=response.getcode())
+        var status = Int(py=_get_status(response))
 
         if status == 200:
             var body_bytes = response.read()
@@ -124,7 +124,7 @@ struct S3Client(Movable):
             return parse_list_objects_v2(xml_body)
         if status == 404:
             raise Error(String("NoSuchBucket: The specified bucket does not exist."))
-        _raise_http_error(response)
+        _raise_http_error_obj(response)
         raise Error(String("Unexpected list response"))
 
 
@@ -137,8 +137,13 @@ def _url_encode(s: String) raises -> String:
     return String(py=urllib.quote(s, safe=""))
 
 
-def _get_header(response: PythonObject, name: String, default: String = "") raises -> String:
-    """Get a header from an HTTP response, with a default if missing."""
+def _get_status(response: PythonObject) raises -> PythonObject:
+    """Get status code from response. Works with http.client.HTTPResponse."""
+    return response.status
+
+
+def _get_response_header(response: PythonObject, name: String, default: String) raises -> String:
+    """Get a header from http.client.HTTPResponse."""
     try:
         var val = response.getheader(name)
         if val is None:
@@ -157,7 +162,10 @@ def _do_s3_request(
     content_type: String = "",
     search_params: String = "",
 ) raises -> PythonObject:
-    """Sign an S3 request and execute it via Python urllib. Returns HTTPResponse."""
+    """
+    Sign an S3 request and execute it via Python http.client.
+    Returns http.client.HTTPResponse.
+    """
     var hash_val = content_hash
     if hash_val == "":
         hash_val = _sha256_hex(body)
@@ -170,25 +178,61 @@ def _do_s3_request(
         content_type=content_type,
     ))
 
-    var urllib_request = Python.import_module("urllib.request")
-    var req = urllib_request.Request(sign_result.url, method=method)
-    req.add_header("Authorization", sign_result.authorization_header)
-    req.add_header("x-amz-content-sha256", sign_result.content_sha256)
-    req.add_header("x-amz-date", sign_result.amz_date)
+    # Parse URL to extract host, port, path+query
+    var (host, port_py, path_and_query) = _parse_url(sign_result.url)
+    var port = Int(py=port_py)
+
+    var http_client = Python.import_module("http.client")
+    var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+
+    # Build headers dict
+    var py_headers = Python.dict()
+    py_headers["Authorization"] = sign_result.authorization_header
+    py_headers["x-amz-content-sha256"] = sign_result.content_sha256
+    py_headers["x-amz-date"] = sign_result.amz_date
     if sign_result.security_token_header != "":
-        req.add_header("x-amz-security-token", sign_result.security_token_header)
+        py_headers["x-amz-security-token"] = sign_result.security_token_header
     if content_type != "":
-        req.add_header("Content-Type", content_type)
+        py_headers["Content-Type"] = content_type
 
-    var data = Python.none()
+    var body_bytes = Python.none()
     if body != "":
-        data = PythonObject(body).encode("utf-8")
+        body_bytes = PythonObject(body).encode("utf-8")
+    else:
+        body_bytes = PythonObject("").encode("utf-8")
 
-    var response = urllib_request.urlopen(req, data=data)
+    conn.request(method, path_and_query, body=body_bytes, headers=py_headers)
+    var response = conn.getresponse()
     return response
 
 
-def _raise_http_error(response: PythonObject) raises:
+def _parse_url(url: String) raises -> Tuple[String, PythonObject, String]:
+    """
+    Parse a URL like 'http://host:port/path?query' into (host, port, path+query).
+    Returns Tuple[String, PythonObject, String] where the port PythonObject is an int
+    that Mojo can convert with Int(py=...).
+    """
+    var url_parse = Python.import_module("urllib.parse")
+    var parsed = url_parse.urlparse(url)
+
+    var host = String(py=parsed.hostname)
+    var port = parsed.port
+    if port is None:
+        var scheme = String(py=parsed.scheme)
+        if scheme == "https":
+            port = PythonObject(443)
+        else:
+            port = PythonObject(80)
+
+    var path_and_query = String(py=parsed.path)
+    var query = parsed.query
+    if query is not None and String(py=query) != "":
+        path_and_query += "?" + String(py=query)
+
+    return (host, port, path_and_query)
+
+
+def _raise_http_error_obj(response: PythonObject) raises:
     """Try to parse an S3 error from the response body and raise it."""
     try:
         var body_bytes = response.read()
@@ -198,5 +242,5 @@ def _raise_http_error(response: PythonObject) raises:
             raise Error(String(code, ": ", message))
     except e:
         _ = e
-    var status = Int(py=response.getcode())
+    var status = Int(py=_get_status(response))
     raise Error(String("S3 request failed with status ", status))
