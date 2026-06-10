@@ -8,6 +8,7 @@ from mos3_signing.signing import sign_request, _sha256_hex
 from mos3_signing.error import S3Error
 from mos3.types import StatSuccess, GetSuccess, PutSuccess, DeleteSuccess, ListObjectsV2Result
 from mos3.xml_parser import parse_list_objects_v2, parse_s3_error
+from std.collections import Dict
 
 
 @fieldwise_init
@@ -132,6 +133,130 @@ struct S3Client(Movable):
     def create_bucket(self) raises -> Bool:
         """Create the configured bucket. Returns True on success."""
         var response = _do_s3_request(self.credentials, "", "PUT", body="")
+        var status = Int(py=_get_status(response))
+        return status == 200
+
+    # ── copy_object ─────────────────────────────────────────────
+
+    def copy_object(self, src: String, dst: String, dst_bucket: String = "") raises -> Bool:
+        """Copy an object within or between buckets."""
+        var src_bucket = self.credentials.bucket
+        var copy_source = "/" + src_bucket + "/" + src
+
+        var dest_creds = self.credentials
+        if dst_bucket != "" and dst_bucket != self.credentials.bucket:
+            dest_creds = S3Credentials.create(
+                access_key_id=self.credentials.access_key_id,
+                secret_access_key=self.credentials.secret_access_key,
+                region=self.credentials.region,
+                endpoint=self.credentials.endpoint,
+                bucket=dst_bucket,
+                session_token=self.credentials.session_token,
+                virtual_hosted_style=self.credentials.virtual_hosted_style,
+                insecure_http=self.credentials.insecure_http,
+            )
+
+        var empty_hash = _sha256_hex("")
+        var sign_result = sign_request(dest_creds, SignOptions.create(
+            path=dst,
+            method="PUT",
+            content_hash=empty_hash,
+        ))
+
+        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
+        var port = Int(py=port_py)
+        var http_client = Python.import_module("http.client")
+        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+
+        var py_headers = Python.dict()
+        py_headers["Authorization"] = sign_result.authorization_header
+        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
+        py_headers["x-amz-date"] = sign_result.amz_date
+        py_headers["x-amz-copy-source"] = PythonObject(copy_source)
+        if sign_result.security_token_header != "":
+            py_headers["x-amz-security-token"] = sign_result.security_token_header
+
+        conn.request("PUT", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
+        var response = conn.getresponse()
+        var status = Int(py=_get_status(response))
+        if status == 200:
+            return True
+        _raise_http_error_obj(response)
+        raise Error(String("Unexpected copy response"))
+
+    # ── put_with_metadata ───────────────────────────────────────
+
+    def put_with_metadata(
+        self,
+        path: String,
+        body: String,
+        metadata: Dict[String, String],
+        content_type: String = "application/octet-stream",
+    ) raises -> PutSuccess:
+        """Upload an object with custom metadata headers."""
+        var content_hash = _sha256_hex(body)
+        var sign_result = sign_request(self.credentials, SignOptions.create(
+            path=path,
+            method="PUT",
+            content_hash=content_hash,
+            content_type=content_type,
+        ))
+
+        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
+        var port = Int(py=port_py)
+        var http_client = Python.import_module("http.client")
+        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+
+        var py_headers = Python.dict()
+        py_headers["Authorization"] = sign_result.authorization_header
+        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
+        py_headers["x-amz-date"] = sign_result.amz_date
+        py_headers["Content-Type"] = PythonObject(content_type)
+        if sign_result.security_token_header != "":
+            py_headers["x-amz-security-token"] = sign_result.security_token_header
+
+        # Add metadata headers
+        for entry in metadata.items():
+            var key = "x-amz-meta-" + entry.key
+            py_headers[key] = PythonObject(entry.value)
+
+        var body_bytes = PythonObject(body).encode("utf-8")
+        conn.request("PUT", path_and_query, body=body_bytes, headers=py_headers)
+        var response = conn.getresponse()
+        var status = Int(py=_get_status(response))
+
+        if status == 200:
+            return PutSuccess(etag=String(py=_get_response_header(response, "ETag", "")))
+        _raise_http_error_obj(response)
+        raise Error(String("Unexpected put_with_metadata response"))
+
+    # ── head_object ─────────────────────────────────────────────
+
+    def head_object(self, path: String) raises -> Dict[String, String]:
+        """Return ALL response headers for an object."""
+        var response = _do_s3_request(self.credentials, path, "HEAD", body="")
+        var status = Int(py=_get_status(response))
+
+        if status == 200:
+            return _get_all_headers(response)
+        if status == 404:
+            raise Error(String("NoSuchKey: The specified key does not exist."))
+        _raise_http_error_obj(response)
+        raise Error(String("Unexpected head_object response"))
+
+    # ── object_exists ───────────────────────────────────────────
+
+    def object_exists(self, path: String) raises -> Bool:
+        """Return True if the object exists."""
+        var response = _do_s3_request(self.credentials, path, "HEAD", body="")
+        var status = Int(py=_get_status(response))
+        return status == 200
+
+    # ── bucket_exists ───────────────────────────────────────────
+
+    def bucket_exists(self) raises -> Bool:
+        """Return True if the bucket exists (HEAD to bucket root)."""
+        var response = _do_s3_request(self.credentials, "", "HEAD", body="")
         var status = Int(py=_get_status(response))
         return status == 200
 
@@ -281,6 +406,17 @@ def _parse_url(url: String) raises -> Tuple[String, PythonObject, String]:
         path_and_query += "?" + String(py=query)
 
     return (host, port, path_and_query)
+
+
+def _get_all_headers(response: PythonObject) raises -> Dict[String, String]:
+    """Extract all headers from an HTTP response into a Dict."""
+    var result = Dict[String, String]()
+    var headers_list = response.getheaders()
+    for item in headers_list:
+        var key = String(py=item[0])
+        var value = String(py=item[1])
+        result[key] = value
+    return result^
 
 
 def _raise_http_error_obj(response: PythonObject) raises:
