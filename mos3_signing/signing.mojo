@@ -70,27 +70,22 @@ def sign_request(credentials: S3Credentials, options: SignOptions) raises -> Sig
     if credentials.virtual_hosted_style and credentials.bucket != "":
         host = credentials.bucket + "." + credentials.endpoint
 
-    # Canonical URI — path-encode, preserving '/'
-    var clean_path = options.path
-    if not clean_path.startswith("/"):
-        clean_path = "/" + clean_path
-    var canonical_uri = "/"
-    if clean_path != "/":
-        # Encode each segment separately, keeping '/' separators
-        var segments_joined = String("")
-        var start: Int = 1  # skip leading '/'
-        for i in range(1, clean_path.byte_length() + 1):
-            if i == clean_path.byte_length() or clean_path[byte=i] == String("/"):
-                var segment = String("")
-                var j = start
-                while j < i:
-                    segment += String(clean_path[byte=j])
-                    j += 1
-                segments_joined += uri_encode(segment, encode_slash=False)
-                if i < clean_path.byte_length():
-                    segments_joined += "/"
-                start = i + 1
-        canonical_uri = "/" + segments_joined
+    # Build full path: for path-style addressing, prepend bucket
+    var raw_path = options.path
+    if not raw_path.startswith("/"):
+        raw_path = "/" + raw_path
+
+    # Prepend bucket for path-style addressing
+    if not credentials.virtual_hosted_style and credentials.bucket != "":
+        raw_path = "/" + credentials.bucket + raw_path
+
+    # Canonical URI — path-encode the full path, preserving '/'
+    var canonical_uri = uri_encode(raw_path, encode_slash=False)
+    if not canonical_uri.startswith("/"):
+        canonical_uri = "/" + canonical_uri
+
+    # Build URL path (same as canonical URI for S3)
+    var url_path = canonical_uri
 
     # Canonical query string (already built by caller)
     var canonical_query = options.search_params
@@ -140,7 +135,7 @@ def sign_request(credentials: S3Credentials, options: SignOptions) raises -> Sig
 
     # Build URL
     var scheme = "http" if credentials.insecure_http else "https"
-    var url = scheme + "://" + host + clean_path
+    var url = scheme + "://" + host + url_path
     if options.search_params != "":
         url += "?" + options.search_params
 

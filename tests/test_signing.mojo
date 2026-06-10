@@ -76,7 +76,7 @@ def test_sign_request_path_style() raises:
     )
     var opts = SignOptions.create(path="/key", method="GET")
     var result = sign_request(creds, opts)
-    assert_true("s3.amazonaws.com/key" in result.url)
+    assert_true("s3.amazonaws.com/mybucket/key" in result.url)
 
 
 def test_sign_request_with_session_token() raises:

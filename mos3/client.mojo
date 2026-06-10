@@ -23,15 +23,14 @@ struct S3Client(Movable):
     def stat(self, path: String) raises -> StatSuccess:
         """Get object metadata without downloading the body."""
         var response = _do_s3_request(self.credentials, path, "HEAD", body="")
-        var status = Int(py=response.status_code)
+        var status = Int(py=response.getcode())
 
         if status == 200:
-            var headers = response.headers
             return StatSuccess(
-                size=Int(String(py=headers.get("Content-Length", "0"))),
-                etag=String(py=headers.get("ETag", "")),
-                last_modified=String(py=headers.get("Last-Modified", "")),
-                content_type=String(py=headers.get("Content-Type", "")),
+                size=Int(String(py=_get_header(response, "Content-Length", "0"))),
+                etag=String(py=_get_header(response, "ETag", "")),
+                last_modified=String(py=_get_header(response, "Last-Modified", "")),
+                content_type=String(py=_get_header(response, "Content-Type", "")),
             )
         if status == 404:
             raise Error(String("NoSuchKey: The specified key does not exist."))
@@ -43,14 +42,13 @@ struct S3Client(Movable):
     def get(self, path: String) raises -> GetSuccess:
         """Download an object. Returns body as String."""
         var response = _do_s3_request(self.credentials, path, "GET", body="")
-        var status = Int(py=response.status_code)
+        var status = Int(py=response.getcode())
 
         if status == 200:
-            var headers = response.headers
             var body_bytes = response.read()
             var body = String(py=body_bytes.decode("utf-8"))
             return GetSuccess(
-                etag=String(py=headers.get("ETag", "")),
+                etag=String(py=_get_header(response, "ETag", "")),
                 body=body,
             )
         if status == 404:
@@ -74,10 +72,9 @@ struct S3Client(Movable):
             content_hash=content_hash,
             content_type=content_type,
         )
-        var status = Int(py=response.status_code)
+        var status = Int(py=response.getcode())
         if status == 200:
-            var headers = response.headers
-            return PutSuccess(etag=String(py=headers.get("ETag", "")))
+            return PutSuccess(etag=String(py=_get_header(response, "ETag", "")))
         _raise_http_error(response)
         raise Error(String("Unexpected put response"))
 
@@ -86,11 +83,10 @@ struct S3Client(Movable):
     def delete(self, path: String) raises -> DeleteSuccess:
         """Delete an object. Returns DeleteSuccess even if already deleted."""
         var response = _do_s3_request(self.credentials, path, "DELETE", body="")
-        var status = Int(py=response.status_code)
+        var status = Int(py=response.getcode())
         if status == 200 or status == 204:
             return DeleteSuccess()
         if status == 404:
-            # Already deleted — still success from caller's perspective
             return DeleteSuccess()
         _raise_http_error(response)
         raise Error(String("Unexpected delete response"))
@@ -120,7 +116,7 @@ struct S3Client(Movable):
             body="",
             search_params=search_params,
         )
-        var status = Int(py=response.status_code)
+        var status = Int(py=response.getcode())
 
         if status == 200:
             var body_bytes = response.read()
@@ -141,6 +137,17 @@ def _url_encode(s: String) raises -> String:
     return String(py=urllib.quote(s, safe=""))
 
 
+def _get_header(response: PythonObject, name: String, default: String = "") raises -> String:
+    """Get a header from an HTTP response, with a default if missing."""
+    try:
+        var val = response.getheader(name)
+        if val is None:
+            return default
+        return String(py=val)
+    except:
+        return default
+
+
 def _do_s3_request(
     credentials: S3Credentials,
     path: String,
@@ -150,10 +157,7 @@ def _do_s3_request(
     content_type: String = "",
     search_params: String = "",
 ) raises -> PythonObject:
-    """
-    Sign an S3 request and execute it via Python urllib.
-    Returns the HTTP response as a PythonObject.
-    """
+    """Sign an S3 request and execute it via Python urllib. Returns HTTPResponse."""
     var hash_val = content_hash
     if hash_val == "":
         hash_val = _sha256_hex(body)
@@ -178,7 +182,7 @@ def _do_s3_request(
 
     var data = Python.none()
     if body != "":
-        data = PythonObject(body.encode("utf-8"))
+        data = PythonObject(body).encode("utf-8")
 
     var response = urllib_request.urlopen(req, data=data)
     return response
@@ -193,6 +197,6 @@ def _raise_http_error(response: PythonObject) raises:
             var (code, message) = parse_s3_error(body)
             raise Error(String(code, ": ", message))
     except e:
-        _ = e  # Fall through
-    var status = Int(py=response.status_code)
+        _ = e
+    var status = Int(py=response.getcode())
     raise Error(String("S3 request failed with status ", status))
