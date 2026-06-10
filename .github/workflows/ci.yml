@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Mojo
+        run: |
+          uv python install 3.11
+          uv venv
+          uv pip install mojo --index https://whl.modular.com/nightly/simple/ --prerelease allow
+
+      - name: Install test deps
+        run: |
+          uv pip install "moto[server]"
+
+      - name: Run unit tests
+        run: |
+          for t in tests/test_error.mojo tests/test_utils.mojo tests/test_credentials.mojo tests/test_crypto.mojo tests/test_signing.mojo tests/test_xml_parsing.mojo; do
+            .venv/bin/mojo run -I . $t
+          done
+
+      - name: Run integration tests
+        run: |
+          python3 tests/test_integration_moto.py
+
+      - name: Run advanced ops tests
+        run: |
+          python3 -c "
+          from moto.server import ThreadedMotoServer
+          import subprocess, urllib.request
+          server = ThreadedMotoServer(port=15001)
+          server.start()
+          try:
+              urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:15001/test-bucket', method='PUT'))
+              urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:15001/dst-bucket', method='PUT'))
+              subprocess.run(['.venv/bin/mojo', 'run', '-I', '.', 'tests/test_advanced_ops.mojo'], check=True)
+          finally:
+              server.stop()
+          "
+
+      - name: Build Python extension
+        run: |
+          .venv/bin/mojo build --emit shared-lib -I . mos3_py.mojo -o mos3_py.so
