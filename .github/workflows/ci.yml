@@ -15,7 +15,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install Mojo
+      - name: Clone flare dependency
+        run: |
+          git clone https://github.com/ehsanmok/flare.git /tmp/flare
+          ln -sf /tmp/flare/flare flare
+
+      - name: Install Mojo (nightly)
         run: |
           uv python install 3.11
           uv venv
@@ -33,11 +38,11 @@ jobs:
 
       - name: Run integration tests
         run: |
-          python3 tests/test_integration_moto.py
+          .venv/bin/python3 tests/test_integration_moto.py
 
       - name: Run advanced ops tests
         run: |
-          python3 -c "
+          .venv/bin/python3 -c "
           from moto.server import ThreadedMotoServer
           import subprocess, urllib.request
           server = ThreadedMotoServer(port=15001)

@@ -11,3 +11,7 @@ wheels/
 
 # Hermes agent plans and workspace
 .hermes/
+
+# Library symlinks (flare, json)
+flare
+json_ext_lib
