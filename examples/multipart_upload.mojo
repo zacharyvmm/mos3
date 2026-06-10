@@ -53,11 +53,11 @@ def main() raises:
 
     # S3 requires parts to be at least 5MB. Generate 5MB of data per part.
     var part_size = 5 * 1024 * 1024  # 5MB per part
-    var data_bytes = Python.evaluate("b'X' * " + str(part_size))
+    var data_bytes = Python.evaluate("b'X' * " + String(part_size))
     var data_part1 = String(py=data_bytes.decode("utf-8"))
 
     # Different data for part 2 to verify integrity
-    var data_part2_bytes = Python.evaluate("b'Y' * " + str(part_size))
+    var data_part2_bytes = Python.evaluate("b'Y' * " + String(part_size))
     var data_part2 = String(py=data_part2_bytes.decode("utf-8"))
 
     # Initiate multipart upload
@@ -83,7 +83,7 @@ def main() raises:
     print("\n--- 2. Concurrent Multipart ---")
 
     # Create 4 parts of 5MB each
-    var concurrent_data = Python.evaluate("b'Z' * " + str(part_size))
+    var concurrent_data = Python.evaluate("b'Z' * " + String(part_size))
     var concurrent_str = String(py=concurrent_data.decode("utf-8"))
 
     var mpu2 = MultipartUpload.create(creds, "concurrent-upload.bin")

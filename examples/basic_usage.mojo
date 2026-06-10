@@ -75,7 +75,7 @@ def main() raises:
     print("Objects with prefix 'photos/':")
     print("  Count:", list_result.key_count)
     for item in list_result.contents:
-        print("   -", item.key, "(" + str(item.size) + " bytes)")
+        print("   -", item.key, "(" + String(item.size) + " bytes)")
 
     # List all objects
     var all_result = client.list_objects(max_keys=100)

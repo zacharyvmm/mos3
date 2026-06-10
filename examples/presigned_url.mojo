@@ -79,7 +79,8 @@ def main() raises:
     print()
 
     # Upload via the presigned URL
-    var upload_data = "Uploaded via presigned PUT URL!".encode("utf-8")
+    var upload_data_str = PythonObject("Uploaded via presigned PUT URL!")
+    var upload_data = upload_data_str.encode("utf-8")
     var put_req = urllib.Request(put_url, data=upload_data, method="PUT")
     put_req.add_header("Content-Type", "text/plain")
     var put_response = urllib.urlopen(put_req)

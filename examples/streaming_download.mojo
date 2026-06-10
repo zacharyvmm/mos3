@@ -88,7 +88,7 @@ def main() raises:
                 preview += String(chunk[byte=i])
                 i += 1
             preview += "..."
-        print("  Chunk", chunk_count1, "(" + str(chunk.byte_length()) + " bytes):", preview)
+        print("  Chunk", chunk_count1, "(" + String(chunk.byte_length()) + " bytes):", preview)
 
     stream1.close()
     print("Total chunks:", chunk_count1)
