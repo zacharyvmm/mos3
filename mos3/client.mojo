@@ -127,6 +127,57 @@ struct S3Client(Movable):
         _raise_http_error_obj(response)
         raise Error(String("Unexpected list response"))
 
+    # ── create_bucket ───────────────────────────────────────────
+
+    def create_bucket(self) raises -> Bool:
+        """Create the configured bucket. Returns True on success."""
+        var response = _do_s3_request(self.credentials, "", "PUT", body="")
+        var status = Int(py=_get_status(response))
+        return status == 200
+
+    # ── get_range ───────────────────────────────────────────────
+
+    def get_range(
+        self, path: String, offset: Int, size: Int
+    ) raises -> GetSuccess:
+        """Download a byte range from an object."""
+        var range_val = "bytes=" + String(offset) + "-" + String(offset + size - 1)
+
+        # Build and sign the request manually to add Range header
+        var sign_result = sign_request(self.credentials, SignOptions.create(
+            path=path,
+            method="GET",
+        ))
+
+        var (host, port_py, path_and_query) = _parse_url(sign_result.url)
+        var port = Int(py=port_py)
+        var http_client = Python.import_module("http.client")
+        var conn = http_client.HTTPConnection(host, port, timeout=PythonObject(30))
+
+        var py_headers = Python.dict()
+        py_headers["Authorization"] = sign_result.authorization_header
+        py_headers["x-amz-content-sha256"] = sign_result.content_sha256
+        py_headers["x-amz-date"] = sign_result.amz_date
+        py_headers["Range"] = PythonObject(range_val)
+        if sign_result.security_token_header != "":
+            py_headers["x-amz-security-token"] = sign_result.security_token_header
+
+        conn.request("GET", path_and_query, body=PythonObject("").encode("utf-8"), headers=py_headers)
+        var response = conn.getresponse()
+        var status = Int(py=_get_status(response))
+
+        if status == 200 or status == 206:
+            var body_bytes = response.read()
+            var body = String(py=body_bytes.decode("utf-8"))
+            return GetSuccess(
+                etag=String(py=_get_response_header(response, "ETag", "")),
+                body=body,
+            )
+        if status == 404:
+            raise Error(String("NoSuchKey: The specified key does not exist."))
+        _raise_http_error_obj(response)
+        raise Error(String("Unexpected get_range response"))
+
 
 # ── Internal helpers ────────────────────────────────────────────
 

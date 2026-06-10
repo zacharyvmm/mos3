@@ -2,6 +2,7 @@
 S3Credentials and signing-related types.
 Mirrors bun_s3_signing::credentials module.
 """
+from std.os import getenv
 from mos3_signing.error import S3Error
 
 
@@ -38,6 +39,56 @@ struct S3Credentials(Movable, Copyable, ImplicitlyCopyable):
             virtual_hosted_style=virtual_hosted_style,
             insecure_http=insecure_http,
         )
+
+    @staticmethod
+    def from_env(
+        bucket: String = "",
+        virtual_hosted_style: Bool = True,
+    ) raises -> Self:
+        """Load credentials from standard AWS environment variables.
+
+        Reads: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (or AWS_DEFAULT_REGION),
+        AWS_SESSION_TOKEN (optional), AWS_ENDPOINT_URL (optional).
+
+        Raises Error if required variables are missing.
+        """
+        var access_key = _env_get("AWS_ACCESS_KEY_ID")
+        var secret_key = _env_get("AWS_SECRET_ACCESS_KEY")
+        if access_key == "" or secret_key == "":
+            raise Error(String(
+                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables are required"
+            ))
+
+        var region = _env_get("AWS_REGION")
+        if region == "":
+            region = _env_get("AWS_DEFAULT_REGION")
+        if region == "":
+            region = "us-east-1"
+
+        var endpoint = _env_get("AWS_ENDPOINT_URL")
+        if endpoint == "":
+            endpoint = "s3.amazonaws.com"
+
+        var session_token = _env_get("AWS_SESSION_TOKEN")
+
+        return Self(
+            access_key_id=access_key,
+            secret_access_key=secret_key,
+            region=region,
+            endpoint=endpoint,
+            bucket=bucket,
+            session_token=session_token,
+            virtual_hosted_style=virtual_hosted_style,
+            insecure_http=False,
+        )
+
+
+def _env_get(name: String) -> String:
+    """Read an environment variable, return empty string if not set."""
+    var val = getenv(name)
+    if val:
+        return val
+    return ""
 
 
 @fieldwise_init

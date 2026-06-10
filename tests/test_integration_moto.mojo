@@ -138,6 +138,45 @@ def test_multipart_abort() raises:
     print("Multipart abort OK")
 
 
+def test_get_range() raises:
+    var client = _make_client()
+    var content = "0123456789ABCDEF"
+    var __put = client.put("range-test.txt", content)
+
+    # Get bytes 0-4
+    var result = client.get_range("range-test.txt", 0, 5)
+    assert_equal(result.body, "01234")
+    print("Range 0-4 OK:", result.body)
+
+    # Get bytes 10-15
+    var result2 = client.get_range("range-test.txt", 10, 6)
+    assert_equal(result2.body, "ABCDEF")
+    print("Range 10-15 OK:", result2.body)
+
+
+def test_create_bucket() raises:
+    # Create a new bucket via the client
+    var creds = S3Credentials.create(
+        access_key_id="AKIAIO...MPLE",
+        secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        region="us-east-1",
+        endpoint="127.0.0.1:15001",
+        bucket="test-bucket-2",
+        virtual_hosted_style=False,
+        insecure_http=True,
+    )
+    var client = S3Client.create(creds)
+    var ok = client.create_bucket()
+    assert_true(ok)
+    print("Create bucket OK")
+
+    # Verify we can use it
+    var __put = client.put("test.txt", "hello from bucket 2")
+    var result = client.get("test.txt")
+    assert_equal(result.body, "hello from bucket 2")
+    print("New bucket works OK")
+
+
 def main() raises:
     test_put_and_get()
     test_stat()
@@ -146,4 +185,6 @@ def main() raises:
     test_streaming_download()
     test_multipart_upload()
     test_multipart_abort()
+    test_get_range()
+    test_create_bucket()
     print("All moto integration tests passed!")
