@@ -138,6 +138,41 @@ def test_multipart_abort() raises:
     print("Multipart abort OK")
 
 
+def test_concurrent_multipart() raises:
+    """Test concurrent multipart upload with 4 parts using ThreadPoolExecutor."""
+    var creds = _make_creds()
+
+    # Initiate multipart upload
+    var mpu = MultipartUpload.create(creds, "concurrent-test.bin")
+    print("Concurrent upload ID:", mpu.upload_id_str())
+
+    # Create 4 parts of 5MB each (S3 minimum part size)
+    var part_size = 5 * 1024 * 1024  # 5MB per part
+    var data_bytes = Python.evaluate("b'Y' * " + String(part_size))
+    var data_part = String(py=data_bytes.decode("utf-8"))
+
+    # Build parts list for concurrent upload
+    var parts_list = List[Tuple[Int, String]]()
+    for i in range(4):
+        parts_list.append((i + 1, data_part))
+
+    # Upload all parts concurrently (queue_size=4 means all in parallel)
+    mpu.upload_parts(parts_list, queue_size=4, retry=3)
+    print("All 4 parts uploaded concurrently")
+
+    # Complete
+    var ok = mpu.complete()
+    assert_true(ok)
+    print("Concurrent multipart complete OK")
+
+    # Verify total size
+    var client = _make_client()
+    var result = client.stat("concurrent-test.bin")
+    var expected = part_size * 4
+    assert_equal(result.size, expected)
+    print("Concurrent content verified, total size:", result.size)
+
+
 def test_get_range() raises:
     var client = _make_client()
     var content = "0123456789ABCDEF"
@@ -185,6 +220,7 @@ def main() raises:
     test_streaming_download()
     test_multipart_upload()
     test_multipart_abort()
+    test_concurrent_multipart()
     test_get_range()
     test_create_bucket()
     print("All moto integration tests passed!")

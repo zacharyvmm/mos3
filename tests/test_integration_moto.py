@@ -29,7 +29,7 @@ def main():
             env={**os.environ, "MOTO_PORT": str(port)},
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
             cwd=os.path.join(os.path.dirname(__file__), ".."),
         )
         print(result.stdout)

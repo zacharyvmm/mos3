@@ -1,11 +1,61 @@
 """
 Multipart upload for S3 objects.
 Implements the S3 multipart upload API: initiate, upload parts, complete, abort.
+Includes concurrent part upload with ThreadPoolExecutor and retry.
 """
 from std.python import Python, PythonObject
-from mos3_signing.credentials import S3Credentials, SignOptions
+from mos3_signing.credentials import S3Credentials, SignOptions, SignResult
 from mos3_signing.signing import sign_request, _sha256_hex
 from mos3.client import _do_s3_request, _get_response_header, _get_status, _raise_http_error_obj
+
+
+# ── Python worker for concurrent part uploads ────────────────────
+# Lazily created Python function that uploads a single S3 part.
+# Defined once and cached for reuse across all upload_parts calls.
+
+
+def _get_upload_worker() raises -> PythonObject:
+    """Get or create the Python worker function for concurrent part uploads."""
+    try:
+        return Python.evaluate("_upload_part")
+    except:
+        var __ = Python.evaluate("""
+exec('''def _upload_part(url, auth_header, amz_date, content_sha256, security_token, body_bytes, part_number, retries):
+    import http.client, time
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path_and_query = parsed.path
+    if parsed.query:
+        path_and_query += "?" + parsed.query
+    last_exc = Exception("unknown error")
+    for attempt in range(retries + 1):
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=30)
+            headers = {"Authorization": auth_header, "x-amz-content-sha256": content_sha256, "x-amz-date": amz_date}
+            if security_token:
+                headers["x-amz-security-token"] = security_token
+            conn.request("PUT", path_and_query, body=body_bytes, headers=headers)
+            resp = conn.getresponse()
+            if resp.status == 200:
+                etag = resp.getheader("ETag", "")
+                conn.close()
+                return (etag, part_number)
+            try:
+                resp.read()
+            except Exception:
+                pass
+            conn.close()
+            raise Exception("Part " + str(part_number) + " upload failed: HTTP " + str(resp.status))
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+    raise last_exc
+''')
+""")
+        return Python.evaluate("_upload_part")
 
 
 @fieldwise_init
@@ -71,6 +121,120 @@ struct MultipartUpload(Movable):
         var part = PartInfo(part_number=part_number, etag=etag)
         self._parts.append(part)
         return part
+
+    def upload_parts(mut self, parts: List[Tuple[Int, String]], queue_size: Int = 4, retry: Int = 3) raises:
+        """Upload multiple parts concurrently using Python ThreadPoolExecutor.
+
+        Each part is (part_number, data). Parts are uploaded in parallel
+        with up to queue_size concurrent workers. Each part retries up
+        to retry times on failure with exponential backoff.
+
+        On success, self._parts is populated with PartInfo for all parts.
+        """
+        if len(parts) == 0:
+            return
+
+        var futures_mod = Python.import_module("concurrent.futures")
+        var executor = futures_mod.ThreadPoolExecutor(max_workers=PythonObject(queue_size))
+
+        var py_upload_part = _get_upload_worker()
+        var py_futures = Python.list()
+
+        # Submit all parts to the thread pool
+        for i in range(len(parts)):
+            var part = parts[i]
+            var (part_number, data) = part
+
+            # Pre-sign the request in Mojo (each part gets its own signature)
+            var search = "partNumber=" + String(part_number) + "&uploadId=" + self.upload_id
+            var content_hash = _sha256_hex(data)
+
+            var sign_result = sign_request(self.credentials, SignOptions.create(
+                path=self.key,
+                method="PUT",
+                search_params=search,
+                content_hash=content_hash,
+            ))
+
+            var body_bytes = PythonObject(data).encode("utf-8")
+            var security = sign_result.security_token_header
+
+            var future = executor.submit(
+                py_upload_part,
+                PythonObject(sign_result.url),
+                PythonObject(sign_result.authorization_header),
+                PythonObject(sign_result.amz_date),
+                PythonObject(sign_result.content_sha256),
+                PythonObject(security),
+                body_bytes,
+                PythonObject(part_number),
+                PythonObject(retry),
+            )
+            py_futures.append(future)
+
+        # Collect results (waits for all to complete)
+        for fut in py_futures:
+            var result = fut.result()  # Python tuple: (etag, part_number)
+            var etag = String(py=result[0])
+            var pn = Int(py=result[1])
+            var part_info = PartInfo(part_number=pn, etag=etag)
+            self._parts.append(part_info)
+
+        # Shut down the executor
+        executor.shutdown(wait=PythonObject(False))
+
+    @staticmethod
+    def upload_file(
+        credentials: S3Credentials,
+        key: String,
+        file_path: String,
+        part_size: Int = 5 * 1024 * 1024,  # 5MB minimum S3 part
+        queue_size: Int = 4,
+        retry: Int = 3,
+    ) raises -> Bool:
+        """Upload a local file using concurrent multipart upload.
+
+        Reads the file, splits it into parts, uploads them concurrently,
+        and completes the multipart upload. Returns True on success.
+        """
+        # Read file using Python
+        var py_builtins = Python.import_module("builtins")
+        var f = py_builtins.open(file_path, "rb")
+        var file_data = f.read()
+        f.close()
+
+        var total_size = Int(py=py_builtins.len(file_data))
+
+        # Initiate multipart upload
+        var mpu = MultipartUpload.create(credentials, key)
+
+        if total_size == 0:
+            # Empty file: just complete with no parts
+            return mpu.complete()
+
+        # Split into parts and build the parts list
+        var parts_list = List[Tuple[Int, String]]()
+        var part_num: Int = 1
+        var offset: Int = 0
+
+        while offset < total_size:
+            var end = offset + part_size
+            if end > total_size:
+                end = total_size
+
+            # Extract chunk using Python slicing
+            var chunk = Python.evaluate("lambda d,o,e: d[o:e]")(file_data, PythonObject(offset), PythonObject(end))
+            var chunk_str = String(py=chunk.decode("utf-8"))
+
+            parts_list.append((part_num, chunk_str))
+            part_num += 1
+            offset = end
+
+        # Upload all parts concurrently
+        mpu.upload_parts(parts_list, queue_size=queue_size, retry=retry)
+
+        # Complete the upload
+        return mpu.complete()
 
     def complete(self) raises -> Bool:
         """Complete the multipart upload. Returns True on success."""
